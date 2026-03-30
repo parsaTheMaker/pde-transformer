@@ -418,6 +418,9 @@ class PDEStage(nn.Module):
             mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
             attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
             attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+            if self.carrier_token_active:
+                # pad mask (the carrier token can attend to all and vice-versa)
+                attn_mask = F.pad(attn_mask, (1, 0, 1, 0), "constant", 0)
         else:
 
             attn_mask = None
@@ -579,8 +582,7 @@ class CarrierTokenAttention2DTimestep(nn.Module):
         if self.posemb_type == 'rope2d':
             self.freqs_cis = None
 
-    def forward(self, x):
-
+    def forward(self, x, attn_mask=None, **kwargs):
         b, n, c = x.size()
         x = torch.unsqueeze(x, 1)
 

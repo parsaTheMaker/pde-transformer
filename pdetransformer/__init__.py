@@ -1,8 +1,10 @@
 """PDE-Transformer: Efficient and Versatile Transformers for Physics Simulations"""
 
-import importlib.metadata
-
-__version__ = importlib.metadata.version("pdetransformer")
+try:
+    import importlib.metadata
+    __version__ = importlib.metadata.version("pdetransformer")
+except Exception:
+    __version__ = "0.1.11"
 
 from . import utils
 from . import visualization

@@ -173,3 +173,7 @@ wandb/
 
 # plot files
 .plots/
+*.mp4
+*.npz
+*.png
+
