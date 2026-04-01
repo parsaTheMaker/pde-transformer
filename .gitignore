@@ -176,5 +176,7 @@ wandb/
 *.mp4
 *.npz
 *.png
+*.json
+karman.py
 
 runs/
