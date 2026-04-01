@@ -4,8 +4,8 @@ import os
 import urllib
 import io
 import json
+from pathlib import Path
 from . import normalization as norm
-import pkg_resources
 import sys
 
 from .logging import info, success, warn, fail, DARKGREY, SUCCESS_CYAN, ENDC
@@ -131,7 +131,7 @@ def dl_parts_from_huggingface(
 def fetch_index_from_huggingface(config):
     repo_id = config["hf_repo_id"]
     url_repo = f"https://huggingface.co/datasets/{repo_id}/resolve/main/"
-    index_path = pkg_resources.resource_filename(__name__, "global_index.json")
+    index_path = Path(__file__).with_name("global_index.json")
 
     try:
         files = get_hf_repo_file_list(repo_id)
@@ -167,7 +167,7 @@ def fetch_index_from_huggingface(config):
             meta_all_combined[r] = meta_all
 
         # cache index for offline access
-        with open(index_path, "w") as f:
+        with index_path.open("w") as f:
             json.dump(meta_all_combined, f)
 
     except (
@@ -178,7 +178,7 @@ def fetch_index_from_huggingface(config):
         warn("Could not fetch global dataset index.")
 
     try:
-        with open(index_path) as index_file:
+        with index_path.open() as index_file:
             return json.load(index_file)
     except (FileNotFoundError, json.JSONDecodeError):
         warn(

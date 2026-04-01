@@ -180,3 +180,4 @@ wandb/
 karman.py
 
 runs/
+.codex

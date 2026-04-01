@@ -14,7 +14,7 @@ import math
 import collections.abc
 
 import numpy as np
-from timm.models.layers import trunc_normal_, DropPath
+from timm.layers import trunc_normal_, DropPath
 import torch
 from transformers.pytorch_utils import meshgrid, find_pruneable_heads_and_indices, prune_linear_layer
 
@@ -576,8 +576,8 @@ class PosEmbMLPSwinv2D(nn.Module):
         relative_coords_w = torch.arange(-(self.window_size[1] - 1), self.window_size[1], dtype=torch.float32)
 
         relative_coords_table = torch.stack(
-            torch.meshgrid([relative_coords_h,
-                            relative_coords_w])).permute(1, 2, 0).contiguous().unsqueeze(0)  # 1, 2*Wh-1, 2*Ww-1, 2
+            torch.meshgrid(relative_coords_h, relative_coords_w, indexing="ij")
+        ).permute(1, 2, 0).contiguous().unsqueeze(0)  # 1, 2*Wh-1, 2*Ww-1, 2
 
         if pretrained_window_size[0] > 0:
             relative_coords_table[:, :, :, 0] /= (pretrained_window_size[0] - 1)
@@ -595,7 +595,7 @@ class PosEmbMLPSwinv2D(nn.Module):
 
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))
         coords_flatten = torch.flatten(coords, 1)
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()
@@ -904,7 +904,9 @@ class PosEmbMLPSwinv1D(nn.Module):
 
             relative_coords_h = torch.arange(0, height, device=input_tensor.device, dtype = input_tensor.dtype)
             relative_coords_w = torch.arange(0, width, device=input_tensor.device, dtype = input_tensor.dtype)
-            relative_coords_table = torch.stack(torch.meshgrid([relative_coords_h, relative_coords_w])).contiguous().unsqueeze(0)
+            relative_coords_table = torch.stack(
+                torch.meshgrid(relative_coords_h, relative_coords_w, indexing="ij")
+            ).contiguous().unsqueeze(0)
             relative_coords_table[:,0] -= height // 2
             relative_coords_table[:,1] -= width // 2
             relative_coords_table[:,0] /= max((height // 2), 1.0) # special case for 1x1

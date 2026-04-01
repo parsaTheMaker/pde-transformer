@@ -747,7 +747,10 @@ class FactorizedTransformer(nn.Module):
     def forward(self, u, pos_lst):
         b, nx, ny, c = u.shape
         nx, ny = pos_lst[0].shape[0], pos_lst[1].shape[0]
-        pos = torch.stack(torch.meshgrid([pos_lst[0].squeeze(-1), pos_lst[1].squeeze(-1)]), dim=-1)
+        pos = torch.stack(
+            torch.meshgrid(pos_lst[0].squeeze(-1), pos_lst[1].squeeze(-1), indexing="ij"),
+            dim=-1,
+        )
         for pos_enc, attn_layer in self.layers:
             u += pos_enc(pos).view(1, nx, ny, -1)
             attn = attn_layer(u, pos_lst)

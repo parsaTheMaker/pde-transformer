@@ -3,7 +3,7 @@ import io
 import sys
 import json
 import urllib.request
-import pkg_resources
+from pathlib import Path
 import h5py
 import numpy as np
 from itertools import groupby
@@ -19,7 +19,7 @@ from . import utilities
 from .logging import info, success, warn, fail, corrupt
 from .utilities import get_sel_const_sim, get_meta_data, scan_local_dset_dir, get_sel_const_sim_v2
 
-config_path = pkg_resources.resource_filename(__name__, "config.json")
+config_path = Path(__file__).with_name("config.json")
 
 # load configuration
 # try:
@@ -36,6 +36,9 @@ config = {
     "dataset_ext": ".hdf5"
 }
 
+local_index = {}
+global_index = {}
+
 def _load_index():
     global local_index
     global global_index
@@ -45,11 +48,18 @@ def _load_index():
     global_index = fetcher.fetch_index(config)
 
 
+def _ensure_index_loaded():
+    if not local_index and not global_index:
+        _load_index()
+
+
 def index():
+    _ensure_index_loaded()
     return global_index | local_index
 
 
 def datasets():
+    _ensure_index_loaded()
     return list((global_index | local_index).keys())
 
 
@@ -566,8 +576,4 @@ class Dataset3D(Dataset):
                     f"Simulation {sim} does not define all declared constants: {missing}."
                 )
                 sys.exit(0)
-
-
-
-_load_index()
 
