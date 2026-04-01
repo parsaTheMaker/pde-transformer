@@ -85,11 +85,11 @@ OUT_DIR = os.path.join("runs", "karman")
 EPOCHS = 40
 BATCH_SIZE = 28
 ACCUM_GRAD = 1
-LR = 1e-5
+LR = 5e-5
 VAL_FRAC = 0.10
 WARMUP_FRAC = 0.3
-MSE_LOSS_WEIGHT = 0.95
-SPEC_LOSS_WEIGHT = 0.05
+MSE_LOSS_WEIGHT = 0.97
+SPEC_LOSS_WEIGHT = 0.03
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
@@ -330,7 +330,7 @@ def get_model():
 def create_optimizer(model):
     adamw_kwargs = {
         "lr": LR,
-        "weight_decay": 1e-2,
+        "weight_decay": 1e-6,
         "foreach": torch.cuda.is_available(),
     }
     if torch.cuda.is_available():
@@ -616,7 +616,7 @@ def main():
         print("  Device prefetch: enabled")
 
     optimizer = create_optimizer(model)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.2)
 
     task_label = torch.tensor([1000], dtype=torch.long, device=DEVICE)
 
