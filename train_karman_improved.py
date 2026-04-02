@@ -12,9 +12,7 @@ import os
 import sys
 from contextlib import suppress
 from datetime import datetime
-from functools import lru_cache
 from multiprocessing import cpu_count, freeze_support
-from typing import Optional, Sequence, Tuple
 
 import matplotlib
 
@@ -92,9 +90,9 @@ LR = 4e-5
 VAL_FRAC = 0.10
 WARMUP_FRAC = 0.3
 # Loss configuration
-MSE_LOSS_WEIGHT = 0.95
-SNPS_WEIGHT = 0.05  # Weight for spectral loss in SNPS loss
-SNPS_NUM_BINS = 12  # Number of radial bins for spectral analysis
+MSE_LOSS_WEIGHT = 0.99
+SPECTRAL_LOSS_WEIGHT = 0.01
+SPECTRAL_NUM_BINS = 12
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
@@ -204,125 +202,87 @@ class MultiSimKarmanDataset(Dataset):
         return x.float(), y.float(), self._get_mask(sim_idx)
 
 
-class SimpleNonPeriodicSpectralLoss(nn.Module):
+class ScaleNormalizedLogBSPLoss(nn.Module):
     """
-    One-step loss for nonperiodic PDE forecasting:
+    MSE + Scale-Normalized Log-BSP for nonperiodic domains.
 
-        L = mse_weight * MSE + lambda_spec * (shape_loss + cdf_loss)
-
-    Shape assumptions:
-        pred, target: [B, C, *spatial_dims]
-
-    Notes:
-    - Nonperiodic handling is done with a fixed separable Hann window
-      before the spatial rFFT.
-    - Radial shell bins are created automatically from the resolution.
-    - Only lambda_spec is meant to be tuned at first.
+    pred, target: [B, C, *spatial]
+    Example:
+        [B, C, H, W]
+        [B, C, D, H, W]
     """
 
-    def __init__(
-        self,
-        mse_weight: float = 0.98,
-        lambda_spec: float = 0.02,
-        num_bins: Optional[int] = None,
-        eps: float = 1e-8,
-    ):
+    def __init__(self, mse_weight=0.95, spectral_weight=0.05, num_bins=12, eps=1e-6):
         super().__init__()
         self.mse_weight = float(mse_weight)
-        self.lambda_spec = float(lambda_spec)
-        self.num_bins = num_bins
+        self.spectral_weight = float(spectral_weight)
+        self.num_bins = int(num_bins)
         self.eps = float(eps)
-
-        # simple cache for window + bin assignment
         self._cache = {}
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred, target, valid_mask=None):
         if pred.shape != target.shape:
-            raise ValueError(f"pred.shape {pred.shape} != target.shape {target.shape}")
+            raise ValueError(f"Shape mismatch: {pred.shape} vs {target.shape}")
         if pred.ndim < 3:
-            raise ValueError("Expected shape [B, C, *spatial_dims]")
+            raise ValueError("Expected shape [B, C, *spatial]")
 
         mse = F.mse_loss(pred, target)
+        spec = self._sn_log_bsp(pred, target, valid_mask)
+        return self.mse_weight * mse + self.spectral_weight * spec
 
-        window, bin_idx, num_bins = self._get_cached_structures(pred)
+    def spectral_only(self, pred, target, valid_mask=None):
+        return self._sn_log_bsp(pred, target, valid_mask)
 
-        # apply nonperiodic taper
-        pred_w = pred * window
-        target_w = target * window
+    def _sn_log_bsp(self, pred, target, valid_mask=None):
+        window, bin_idx = self._get_window_and_bins(pred)
+        valid_mask = self._prepare_valid_mask(valid_mask, pred)
+
+        # Apply spatial window and domain-valid mask before FFT so masked regions
+        # do not contribute spectral energy.
+        taper = window * valid_mask
+        pred_w = pred * taper
+        target_w = target * taper
 
         spatial_dims = tuple(range(2, pred.ndim))
 
-        # orthonormal real FFT on spatial axes
-        pred_spec = torch.fft.rfftn(pred_w, dim=spatial_dims, norm="ortho")
-        target_spec = torch.fft.rfftn(target_w, dim=spatial_dims, norm="ortho")
+        pred_fft = torch.fft.rfftn(pred_w, dim=spatial_dims, norm="ortho")
+        target_fft = torch.fft.rfftn(target_w, dim=spatial_dims, norm="ortho")
 
-        pred_power = pred_spec.real.square() + pred_spec.imag.square()
-        target_power = target_spec.real.square() + target_spec.imag.square()
+        pred_energy = 0.5 * (pred_fft.real.square() + pred_fft.imag.square())
+        target_energy = 0.5 * (target_fft.real.square() + target_fft.imag.square())
 
-        # flatten spectral axes -> [B, C, K]
-        pred_power = pred_power.flatten(start_dim=2)
-        target_power = target_power.flatten(start_dim=2)
+        pred_energy = pred_energy.flatten(start_dim=2)
+        target_energy = target_energy.flatten(start_dim=2)
 
-        # shell-averaged energies: [B, C, M]
-        pred_E = self._bin_average(pred_power, bin_idx, num_bins)
-        target_E = self._bin_average(target_power, bin_idx, num_bins)
+        pred_bins = self._bin_average(pred_energy, bin_idx, self.num_bins)
+        target_bins = self._bin_average(target_energy, bin_idx, self.num_bins)
 
-        # 1) BSP-style log-energy ratio term
-        shape_loss = torch.mean(
-            torch.log((pred_E + self.eps) / (target_E + self.eps)).square()
-        )
+        pred_bins = pred_bins / (pred_bins.sum(dim=-1, keepdim=True) + self.eps)
+        target_bins = target_bins / (target_bins.sum(dim=-1, keepdim=True) + self.eps)
 
-        # 2) Soft peak/scale-location term via CDF mismatch
-        pred_p = pred_E / (pred_E.sum(dim=-1, keepdim=True) + self.eps)
-        target_p = target_E / (target_E.sum(dim=-1, keepdim=True) + self.eps)
+        loss = torch.abs(torch.log((pred_bins + self.eps) / (target_bins + self.eps))).mean()
+        return loss
 
-        pred_cdf = pred_p.cumsum(dim=-1)
-        target_cdf = target_p.cumsum(dim=-1)
+    def _prepare_valid_mask(self, valid_mask, x):
+        if valid_mask is None:
+            return torch.ones_like(x)
 
-        cdf_loss = torch.mean((pred_cdf - target_cdf).square())
+        vm = valid_mask.to(device=x.device, dtype=x.dtype)
+        if vm.ndim == x.ndim - 1:
+            vm = vm.unsqueeze(1)
+        if vm.ndim != x.ndim:
+            raise ValueError(f"Mask ndim {vm.ndim} incompatible with input ndim {x.ndim}")
+        if vm.shape[0] != x.shape[0] or vm.shape[2:] != x.shape[2:]:
+            raise ValueError(f"Mask shape {vm.shape} incompatible with input shape {x.shape}")
 
-        spec_loss = shape_loss + cdf_loss
-        total = self.mse_weight * mse + self.lambda_spec * spec_loss
-        return total
+        if vm.shape[1] == 1 and x.shape[1] != 1:
+            vm = vm.expand(-1, x.shape[1], *x.shape[2:])
+        elif vm.shape[1] != x.shape[1]:
+            raise ValueError(f"Mask channels {vm.shape[1]} must be 1 or match input channels {x.shape[1]}")
 
-    def spectral_terms(self, pred: torch.Tensor, target: torch.Tensor) -> dict:
-        """
-        Optional helper for logging.
-        """
-        if pred.shape != target.shape:
-            raise ValueError(f"pred.shape {pred.shape} != target.shape {target.shape}")
+        return vm.clamp(0.0, 1.0)
 
-        window, bin_idx, num_bins = self._get_cached_structures(pred)
-        spatial_dims = tuple(range(2, pred.ndim))
-
-        pred_spec = torch.fft.rfftn(pred * window, dim=spatial_dims, norm="ortho")
-        target_spec = torch.fft.rfftn(target * window, dim=spatial_dims, norm="ortho")
-
-        pred_power = (pred_spec.real.square() + pred_spec.imag.square()).flatten(start_dim=2)
-        target_power = (target_spec.real.square() + target_spec.imag.square()).flatten(start_dim=2)
-
-        pred_E = self._bin_average(pred_power, bin_idx, num_bins)
-        target_E = self._bin_average(target_power, bin_idx, num_bins)
-
-        shape_loss = torch.mean(
-            torch.log((pred_E + self.eps) / (target_E + self.eps)).square()
-        )
-
-        pred_p = pred_E / (pred_E.sum(dim=-1, keepdim=True) + self.eps)
-        target_p = target_E / (target_E.sum(dim=-1, keepdim=True) + self.eps)
-
-        cdf_loss = torch.mean((pred_p.cumsum(dim=-1) - target_p.cumsum(dim=-1)).square())
-        mse = F.mse_loss(pred, target)
-
-        return {
-            "mse": mse.detach(),
-            "shape_loss": shape_loss.detach(),
-            "cdf_loss": cdf_loss.detach(),
-            "spec_loss": (shape_loss + cdf_loss).detach(),
-            "total": (self.mse_weight * mse + self.lambda_spec * (shape_loss + cdf_loss)).detach(),
-        }
-
-    def _get_cached_structures(self, x: torch.Tensor):
+    def _get_window_and_bins(self, x):
         key = (tuple(x.shape[2:]), x.device, x.dtype, self.num_bins)
         if key in self._cache:
             return self._cache[key]
@@ -332,44 +292,27 @@ class SimpleNonPeriodicSpectralLoss(nn.Module):
         dtype = x.dtype
 
         window = self._make_separable_hann(spatial_shape, device=device, dtype=dtype)
-        bin_idx, num_bins = self._make_radial_bins(spatial_shape, device=device)
+        bin_idx = self._make_radial_bin_index(spatial_shape, device=device)
 
-        self._cache[key] = (window, bin_idx, num_bins)
-        return self._cache[key]
+        self._cache[key] = (window, bin_idx)
+        return window, bin_idx
 
     @staticmethod
-    def _make_separable_hann(
-        spatial_shape: Sequence[int],
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """
-        Returns shape [1, 1, *spatial_shape]
-        """
+    def _make_separable_hann(spatial_shape, device, dtype):
         w = None
+        nd = len(spatial_shape)
         for i, n in enumerate(spatial_shape):
             wi = torch.hann_window(n, periodic=False, device=device, dtype=dtype)
-            shape = [1] * (2 + len(spatial_shape))
+            shape = [1] * (2 + nd)
             shape[2 + i] = n
             wi = wi.view(*shape)
             w = wi if w is None else w * wi
         return w
 
-    def _make_radial_bins(
-        self,
-        spatial_shape: Sequence[int],
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, int]:
-        """
-        Build radial shell assignments for rFFTN output layout.
-        Returns:
-            bin_idx: [K] long tensor
-            num_bins: int
-        """
+    def _make_radial_bin_index(self, spatial_shape, device):
         dims = len(spatial_shape)
         freq_axes = []
 
-        # all full fftfreq except the last axis, which is rfftfreq
         for i, n in enumerate(spatial_shape):
             if i < dims - 1:
                 f = torch.fft.fftfreq(n, d=1.0, device=device)
@@ -381,39 +324,30 @@ class SimpleNonPeriodicSpectralLoss(nn.Module):
         radius = torch.zeros_like(mesh[0])
         for g in mesh:
             radius = radius + g.square()
-        radius = radius.sqrt()
+        radius = radius.sqrt().flatten()
 
-        radius = radius.flatten()
+        edges = torch.linspace(
+            0.0,
+            radius.max() + 1e-12,
+            steps=self.num_bins + 1,
+            device=device,
+        )
 
-        # automatic, resolution-aware default bin count
-        if self.num_bins is None:
-            num_bins = max(8, min(16, min(spatial_shape) // 4))
-        else:
-            num_bins = int(self.num_bins)
-
-        rmax = radius.max().item()
-        edges = torch.linspace(0.0, rmax + 1e-12, steps=num_bins + 1, device=device)
-
-        # bucketize -> bins in [0, num_bins-1]
         bin_idx = torch.bucketize(radius, edges[1:-1], right=False)
-        return bin_idx.long(), num_bins
+        return bin_idx.long()
 
     @staticmethod
-    def _bin_average(power_flat: torch.Tensor, bin_idx: torch.Tensor, num_bins: int) -> torch.Tensor:
-        """
-        power_flat: [B, C, K]
-        bin_idx:    [K]
-        returns:    [B, C, M]
-        """
-        B, C, K = power_flat.shape
+    def _bin_average(energy_flat, bin_idx, num_bins):
+        # energy_flat: [B, C, K]
+        B, C, K = energy_flat.shape
         out = []
 
         for m in range(num_bins):
             mask = (bin_idx == m)
-            if torch.any(mask):
-                Em = power_flat[..., mask].mean(dim=-1)
+            if mask.any():
+                Em = energy_flat[..., mask].mean(dim=-1)
             else:
-                Em = torch.zeros(B, C, device=power_flat.device, dtype=power_flat.dtype)
+                Em = torch.zeros(B, C, device=energy_flat.device, dtype=energy_flat.dtype)
             out.append(Em)
 
         return torch.stack(out, dim=-1)
@@ -623,8 +557,9 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimi
             pred = pred.float()
             pred = torch.lerp(zero_norm, pred, mask)
 
-            total_loss = loss_fn(pred, y)
-            terms = loss_fn.spectral_terms(pred, y)
+            mse_loss = F.mse_loss(pred, y)
+            spec_loss = loss_fn.spectral_only(pred, y, valid_mask=mask)
+            total_loss = loss_fn(pred, y, valid_mask=mask)
 
             if training:
                 (total_loss / ACCUM_GRAD).backward()
@@ -634,9 +569,9 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimi
                     optimizer.zero_grad(set_to_none=True)
 
             batch_size = x.shape[0]
-            loss_accum["total"] += terms["total"].item() * batch_size
-            loss_accum["mse"] += terms["mse"].item() * batch_size
-            loss_accum["spec"] += terms["spec_loss"].item() * batch_size
+            loss_accum["total"] += total_loss.item() * batch_size
+            loss_accum["mse"] += mse_loss.item() * batch_size
+            loss_accum["spec"] += spec_loss.item() * batch_size
             sample_count += batch_size
             if step == 0 or (step + 1) % TQDM_UPDATE_EVERY == 0 or (step + 1) == len(loader):
                 update_progress(progress_bar, loss_accum, sample_count)
@@ -809,19 +744,18 @@ def main():
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.25)
 
     # Build loss function
-    loss_fn = SimpleNonPeriodicSpectralLoss(
+    loss_fn = ScaleNormalizedLogBSPLoss(
         mse_weight=MSE_LOSS_WEIGHT,
-        lambda_spec=SNPS_WEIGHT,
-        num_bins=SNPS_NUM_BINS,
-        eps=1e-8,
+        spectral_weight=SPECTRAL_LOSS_WEIGHT,
+        num_bins=SPECTRAL_NUM_BINS,
+        eps=1e-6,
     ).to(DEVICE)
-    print(f"\nLoss: SimpleNonPeriodicSpectralLoss (Weighted Hybrid)")
-    print(f"  MSE weight: {MSE_LOSS_WEIGHT}")
-    print(f"  Spectral weight: {SNPS_WEIGHT}")
-    print(f"  Total weight: {MSE_LOSS_WEIGHT + SNPS_WEIGHT}")
-    print(f"  Spectral bins: {SNPS_NUM_BINS}")
-    if abs((MSE_LOSS_WEIGHT + SNPS_WEIGHT) - 1.0) > 1e-6:
-        print(f"  ⚠️  WARNING: Weights sum to {MSE_LOSS_WEIGHT + SNPS_WEIGHT}, not 1.0!")
+    print(f"\nLoss: ScaleNormalizedLogBSPLoss")
+    print(f"  MSE weight: {loss_fn.mse_weight}")
+    print(f"  Spectral weight: {loss_fn.spectral_weight}")
+    print(f"  Spectral bins: {loss_fn.num_bins}")
+    if abs((loss_fn.mse_weight + loss_fn.spectral_weight) - 1.0) > 1e-6:
+        print(f"  WARNING: loss weights sum to {loss_fn.mse_weight + loss_fn.spectral_weight:.4f}, not 1.0")
 
     task_label = torch.tensor([1000], dtype=torch.long, device=DEVICE)
 
