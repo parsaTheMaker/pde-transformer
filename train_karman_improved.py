@@ -12,7 +12,9 @@ import os
 import sys
 from contextlib import suppress
 from datetime import datetime
+from functools import lru_cache
 from multiprocessing import cpu_count, freeze_support
+from typing import Optional, Sequence, Tuple
 
 import matplotlib
 
@@ -22,6 +24,7 @@ import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from matplotlib.colors import Normalize
 from torch.utils.data import DataLoader, Dataset
@@ -80,7 +83,7 @@ np.random.seed(42)
 
 # User-editable configuration.
 # Use normal Python values here instead of environment variables.
-SIM_ROOT = "./256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
+SIM_ROOT = "/home/vatani/data_vortex/256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
 OUT_DIR = os.path.join("runs", "karman")
 EPOCHS = 40
 BATCH_SIZE = 28
@@ -88,8 +91,10 @@ ACCUM_GRAD = 1
 LR = 4e-5
 VAL_FRAC = 0.10
 WARMUP_FRAC = 0.3
-MSE_LOSS_WEIGHT = 1.0
-SPEC_LOSS_WEIGHT = 0.0
+# Loss configuration
+MSE_LOSS_WEIGHT = 0.95
+SNPS_WEIGHT = 0.05  # Weight for spectral loss in SNPS loss
+SNPS_NUM_BINS = 12  # Number of radial bins for spectral analysis
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
@@ -112,19 +117,6 @@ TQDM_UPDATE_EVERY = 20
 def packed_slice_to_numpy(array):
     return np.array(array, dtype=np.float32, copy=True)
 
-
-_HANN_WINDOW_CACHE = {}
-
-
-def get_hann_window2d(height, width, device, dtype):
-    key = (height, width, str(device), dtype)
-    window2d = _HANN_WINDOW_CACHE.get(key)
-    if window2d is None:
-        wy = torch.hann_window(height, periodic=False, device=device, dtype=dtype)
-        wx = torch.hann_window(width, periodic=False, device=device, dtype=dtype)
-        window2d = (wy[:, None] * wx[None, :]).unsqueeze(0).unsqueeze(0)
-        _HANN_WINDOW_CACHE[key] = window2d
-    return window2d
 
 def split_simulations(sim_infos, val_frac):
     if len(sim_infos) <= 1:
@@ -212,21 +204,219 @@ class MultiSimKarmanDataset(Dataset):
         return x.float(), y.float(), self._get_mask(sim_idx)
 
 
-def hybrid_spatial_spectral_loss(pred, target, eps=1e-6):
-    spatial_mse = F.mse_loss(pred, target)
-    height, width = pred.shape[-2:]
-    window2d = get_hann_window2d(height, width, pred.device, pred.dtype)
+class SimpleNonPeriodicSpectralLoss(nn.Module):
+    """
+    One-step loss for nonperiodic PDE forecasting:
 
-    pred_win = pred * window2d
-    target_win = target * window2d
-    pred_fft = torch.fft.rfft2(pred_win, dim=(-2, -1), norm="ortho")
-    target_fft = torch.fft.rfft2(target_win, dim=(-2, -1), norm="ortho")
-    diff_power = (pred_fft - target_fft).abs().pow(2)
-    target_power = target_fft.abs().pow(2)
-    spectral_loss = (diff_power / (target_power.detach() + eps)).mean()
+        L = mse_weight * MSE + lambda_spec * (shape_loss + cdf_loss)
 
-    total_loss = MSE_LOSS_WEIGHT * spatial_mse + SPEC_LOSS_WEIGHT * spectral_loss
-    return total_loss, spatial_mse.detach(), spectral_loss.detach()
+    Shape assumptions:
+        pred, target: [B, C, *spatial_dims]
+
+    Notes:
+    - Nonperiodic handling is done with a fixed separable Hann window
+      before the spatial rFFT.
+    - Radial shell bins are created automatically from the resolution.
+    - Only lambda_spec is meant to be tuned at first.
+    """
+
+    def __init__(
+        self,
+        mse_weight: float = 0.98,
+        lambda_spec: float = 0.02,
+        num_bins: Optional[int] = None,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.mse_weight = float(mse_weight)
+        self.lambda_spec = float(lambda_spec)
+        self.num_bins = num_bins
+        self.eps = float(eps)
+
+        # simple cache for window + bin assignment
+        self._cache = {}
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if pred.shape != target.shape:
+            raise ValueError(f"pred.shape {pred.shape} != target.shape {target.shape}")
+        if pred.ndim < 3:
+            raise ValueError("Expected shape [B, C, *spatial_dims]")
+
+        mse = F.mse_loss(pred, target)
+
+        window, bin_idx, num_bins = self._get_cached_structures(pred)
+
+        # apply nonperiodic taper
+        pred_w = pred * window
+        target_w = target * window
+
+        spatial_dims = tuple(range(2, pred.ndim))
+
+        # orthonormal real FFT on spatial axes
+        pred_spec = torch.fft.rfftn(pred_w, dim=spatial_dims, norm="ortho")
+        target_spec = torch.fft.rfftn(target_w, dim=spatial_dims, norm="ortho")
+
+        pred_power = pred_spec.real.square() + pred_spec.imag.square()
+        target_power = target_spec.real.square() + target_spec.imag.square()
+
+        # flatten spectral axes -> [B, C, K]
+        pred_power = pred_power.flatten(start_dim=2)
+        target_power = target_power.flatten(start_dim=2)
+
+        # shell-averaged energies: [B, C, M]
+        pred_E = self._bin_average(pred_power, bin_idx, num_bins)
+        target_E = self._bin_average(target_power, bin_idx, num_bins)
+
+        # 1) BSP-style log-energy ratio term
+        shape_loss = torch.mean(
+            torch.log((pred_E + self.eps) / (target_E + self.eps)).square()
+        )
+
+        # 2) Soft peak/scale-location term via CDF mismatch
+        pred_p = pred_E / (pred_E.sum(dim=-1, keepdim=True) + self.eps)
+        target_p = target_E / (target_E.sum(dim=-1, keepdim=True) + self.eps)
+
+        pred_cdf = pred_p.cumsum(dim=-1)
+        target_cdf = target_p.cumsum(dim=-1)
+
+        cdf_loss = torch.mean((pred_cdf - target_cdf).square())
+
+        spec_loss = shape_loss + cdf_loss
+        total = self.mse_weight * mse + self.lambda_spec * spec_loss
+        return total
+
+    def spectral_terms(self, pred: torch.Tensor, target: torch.Tensor) -> dict:
+        """
+        Optional helper for logging.
+        """
+        if pred.shape != target.shape:
+            raise ValueError(f"pred.shape {pred.shape} != target.shape {target.shape}")
+
+        window, bin_idx, num_bins = self._get_cached_structures(pred)
+        spatial_dims = tuple(range(2, pred.ndim))
+
+        pred_spec = torch.fft.rfftn(pred * window, dim=spatial_dims, norm="ortho")
+        target_spec = torch.fft.rfftn(target * window, dim=spatial_dims, norm="ortho")
+
+        pred_power = (pred_spec.real.square() + pred_spec.imag.square()).flatten(start_dim=2)
+        target_power = (target_spec.real.square() + target_spec.imag.square()).flatten(start_dim=2)
+
+        pred_E = self._bin_average(pred_power, bin_idx, num_bins)
+        target_E = self._bin_average(target_power, bin_idx, num_bins)
+
+        shape_loss = torch.mean(
+            torch.log((pred_E + self.eps) / (target_E + self.eps)).square()
+        )
+
+        pred_p = pred_E / (pred_E.sum(dim=-1, keepdim=True) + self.eps)
+        target_p = target_E / (target_E.sum(dim=-1, keepdim=True) + self.eps)
+
+        cdf_loss = torch.mean((pred_p.cumsum(dim=-1) - target_p.cumsum(dim=-1)).square())
+        mse = F.mse_loss(pred, target)
+
+        return {
+            "mse": mse.detach(),
+            "shape_loss": shape_loss.detach(),
+            "cdf_loss": cdf_loss.detach(),
+            "spec_loss": (shape_loss + cdf_loss).detach(),
+            "total": (self.mse_weight * mse + self.lambda_spec * (shape_loss + cdf_loss)).detach(),
+        }
+
+    def _get_cached_structures(self, x: torch.Tensor):
+        key = (tuple(x.shape[2:]), x.device, x.dtype, self.num_bins)
+        if key in self._cache:
+            return self._cache[key]
+
+        spatial_shape = x.shape[2:]
+        device = x.device
+        dtype = x.dtype
+
+        window = self._make_separable_hann(spatial_shape, device=device, dtype=dtype)
+        bin_idx, num_bins = self._make_radial_bins(spatial_shape, device=device)
+
+        self._cache[key] = (window, bin_idx, num_bins)
+        return self._cache[key]
+
+    @staticmethod
+    def _make_separable_hann(
+        spatial_shape: Sequence[int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Returns shape [1, 1, *spatial_shape]
+        """
+        w = None
+        for i, n in enumerate(spatial_shape):
+            wi = torch.hann_window(n, periodic=False, device=device, dtype=dtype)
+            shape = [1] * (2 + len(spatial_shape))
+            shape[2 + i] = n
+            wi = wi.view(*shape)
+            w = wi if w is None else w * wi
+        return w
+
+    def _make_radial_bins(
+        self,
+        spatial_shape: Sequence[int],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Build radial shell assignments for rFFTN output layout.
+        Returns:
+            bin_idx: [K] long tensor
+            num_bins: int
+        """
+        dims = len(spatial_shape)
+        freq_axes = []
+
+        # all full fftfreq except the last axis, which is rfftfreq
+        for i, n in enumerate(spatial_shape):
+            if i < dims - 1:
+                f = torch.fft.fftfreq(n, d=1.0, device=device)
+            else:
+                f = torch.fft.rfftfreq(n, d=1.0, device=device)
+            freq_axes.append(f)
+
+        mesh = torch.meshgrid(*freq_axes, indexing="ij")
+        radius = torch.zeros_like(mesh[0])
+        for g in mesh:
+            radius = radius + g.square()
+        radius = radius.sqrt()
+
+        radius = radius.flatten()
+
+        # automatic, resolution-aware default bin count
+        if self.num_bins is None:
+            num_bins = max(8, min(16, min(spatial_shape) // 4))
+        else:
+            num_bins = int(self.num_bins)
+
+        rmax = radius.max().item()
+        edges = torch.linspace(0.0, rmax + 1e-12, steps=num_bins + 1, device=device)
+
+        # bucketize -> bins in [0, num_bins-1]
+        bin_idx = torch.bucketize(radius, edges[1:-1], right=False)
+        return bin_idx.long(), num_bins
+
+    @staticmethod
+    def _bin_average(power_flat: torch.Tensor, bin_idx: torch.Tensor, num_bins: int) -> torch.Tensor:
+        """
+        power_flat: [B, C, K]
+        bin_idx:    [K]
+        returns:    [B, C, M]
+        """
+        B, C, K = power_flat.shape
+        out = []
+
+        for m in range(num_bins):
+            mask = (bin_idx == m)
+            if torch.any(mask):
+                Em = power_flat[..., mask].mean(dim=-1)
+            else:
+                Em = torch.zeros(B, C, device=power_flat.device, dtype=power_flat.dtype)
+            out.append(Em)
+
+        return torch.stack(out, dim=-1)
 
 
 def build_loader(dataset, shuffle):
@@ -353,11 +543,12 @@ def move_batch_to_device(x, y, mask):
     return x, y, mask
 
 
-def update_progress(progress_bar, total_loss_sum, mse_sum, spec_sum, sample_count):
+def update_progress(progress_bar, loss_dict, sample_count):
+    avg_loss_dict = {k: v / max(1, sample_count) for k, v in loss_dict.items()}
     progress_bar.set_postfix(
-        tot=f"{total_loss_sum / max(1, sample_count):.6f}",
-        mse=f"{mse_sum / max(1, sample_count):.6f}",
-        sp=f"{spec_sum / max(1, sample_count):.6f}",
+        tot=f"{avg_loss_dict['total']:.6f}",
+        mse=f"{avg_loss_dict['mse']:.6f}",
+        spec=f"{avg_loss_dict['spec']:.6f}",
     )
 
 
@@ -408,7 +599,7 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")
 
 
-def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None):
+def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimizer=None):
     if training:
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -417,9 +608,7 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None)
         model.eval()
         desc = "va"
 
-    loss_sum = 0.0
-    mse_sum = 0.0
-    spec_sum = 0.0
+    loss_accum = {"total": 0.0, "mse": 0.0, "spec": 0.0}
     sample_count = 0
 
     context = torch.enable_grad if training else torch.inference_mode
@@ -434,28 +623,29 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None)
             pred = pred.float()
             pred = torch.lerp(zero_norm, pred, mask)
 
-            raw_loss, mse_term, spec_term = hybrid_spatial_spectral_loss(pred, y)
+            total_loss = loss_fn(pred, y)
+            terms = loss_fn.spectral_terms(pred, y)
 
             if training:
-                (raw_loss / ACCUM_GRAD).backward()
+                (total_loss / ACCUM_GRAD).backward()
                 if (step + 1) % ACCUM_GRAD == 0 or (step + 1) == len(loader):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
             batch_size = x.shape[0]
-            loss_sum += raw_loss.item() * batch_size
-            mse_sum += mse_term.item() * batch_size
-            spec_sum += spec_term.item() * batch_size
+            loss_accum["total"] += terms["total"].item() * batch_size
+            loss_accum["mse"] += terms["mse"].item() * batch_size
+            loss_accum["spec"] += terms["spec_loss"].item() * batch_size
             sample_count += batch_size
             if step == 0 or (step + 1) % TQDM_UPDATE_EVERY == 0 or (step + 1) == len(loader):
-                update_progress(progress_bar, loss_sum, mse_sum, spec_sum, sample_count)
+                update_progress(progress_bar, loss_accum, sample_count)
 
-    return (
-        loss_sum / max(1, sample_count),
-        mse_sum / max(1, sample_count),
-        spec_sum / max(1, sample_count),
-    )
+    return {
+        "total": loss_accum["total"] / max(1, sample_count),
+        "mse": loss_accum["mse"] / max(1, sample_count),
+        "spec": loss_accum["spec"] / max(1, sample_count),
+    }
 
 
 def save_rollout_video(model_to_render, sim_info, mean, std, zero_norm, get_labels_fn, out_path, title_tag):
@@ -618,17 +808,28 @@ def main():
     optimizer = create_optimizer(model)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.25)
 
+    # Build loss function
+    loss_fn = SimpleNonPeriodicSpectralLoss(
+        mse_weight=MSE_LOSS_WEIGHT,
+        lambda_spec=SNPS_WEIGHT,
+        num_bins=SNPS_NUM_BINS,
+        eps=1e-8,
+    ).to(DEVICE)
+    print(f"\nLoss: SimpleNonPeriodicSpectralLoss (Weighted Hybrid)")
+    print(f"  MSE weight: {MSE_LOSS_WEIGHT}")
+    print(f"  Spectral weight: {SNPS_WEIGHT}")
+    print(f"  Total weight: {MSE_LOSS_WEIGHT + SNPS_WEIGHT}")
+    print(f"  Spectral bins: {SNPS_NUM_BINS}")
+    if abs((MSE_LOSS_WEIGHT + SNPS_WEIGHT) - 1.0) > 1e-6:
+        print(f"  ⚠️  WARNING: Weights sum to {MSE_LOSS_WEIGHT + SNPS_WEIGHT}, not 1.0!")
+
     task_label = torch.tensor([1000], dtype=torch.long, device=DEVICE)
 
     def get_labels(batch_size):
         return task_label.expand(batch_size)
 
-    train_losses = []
-    val_losses = []
-    train_mse_terms = []
-    train_spec_terms = []
-    val_mse_terms = []
-    val_spec_terms = []
+    train_losses = {"total": [], "mse": [], "spec": []}
+    val_losses = {"total": [], "mse": [], "spec": []}
     best_val = math.inf
     loss_log_path = None
     start_epoch = 1
@@ -653,43 +854,47 @@ def main():
             print("Successfully loaded model weights from checkpoint; optimizer/scheduler state not found.")
 
     if not SKIP_TRAIN:
-        loss_log_path = os.path.join(OUT_DIR, f"hybrid_loss_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        loss_log_path = os.path.join(OUT_DIR, f"loss_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
         with open(loss_log_path, "w", encoding="utf-8") as log_file:
-            log_file.write("timestamp epoch hybrid_loss train_mse train_spec val_loss val_mse val_spec best\n")
+            log_file.write("timestamp epoch lr train_total train_mse train_spec val_total val_mse val_spec best\n")
 
         for epoch in range(start_epoch, EPOCHS + 1):
-            train_loss, train_mse_avg, train_spec_avg = run_epoch(
+            # Print current learning rate
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"\nEpoch {epoch:02d}/{EPOCHS}  LR: {current_lr:.2e}")
+
+            train_loss = run_epoch(
                 model=model,
                 loader=train_loader,
                 zero_norm=zero_norm,
                 get_labels_fn=get_labels,
+                loss_fn=loss_fn,
                 training=True,
                 optimizer=optimizer,
             )
 
             if val_loader is None:
-                val_loss = float("inf")
-                val_mse_avg = float("nan")
-                val_spec_avg = float("nan")
+                val_loss = {"total": float("inf"), "mse": float("nan"), "spec": float("nan")}
             else:
-                val_loss, val_mse_avg, val_spec_avg = run_epoch(
+                val_loss = run_epoch(
                     model=model,
                     loader=val_loader,
                     zero_norm=zero_norm,
                     get_labels_fn=get_labels,
+                    loss_fn=loss_fn,
                     training=False,
                 )
 
             scheduler.step()
-            train_losses.append(train_loss)
-            val_losses.append(val_loss)
-            train_mse_terms.append(train_mse_avg)
-            train_spec_terms.append(train_spec_avg)
-            val_mse_terms.append(val_mse_avg)
-            val_spec_terms.append(val_spec_avg)
+            train_losses["total"].append(train_loss["total"])
+            train_losses["mse"].append(train_loss["mse"])
+            train_losses["spec"].append(train_loss["spec"])
+            val_losses["total"].append(val_loss["total"])
+            val_losses["mse"].append(val_loss["mse"])
+            val_losses["spec"].append(val_loss["spec"])
 
-            if val_loss < best_val:
-                best_val = val_loss
+            if val_loss["total"] < best_val:
+                best_val = val_loss["total"]
                 best_marker = " ← best"
             else:
                 best_marker = ""
@@ -702,36 +907,53 @@ def main():
                 save_rollout_video(model, video_sim, mean, std, zero_norm, get_labels, epoch_video_path, f"Epoch {epoch:03d}")
 
             print(
-                f"Epoch {epoch:02d}/{EPOCHS}  comprehensive_loss={train_loss:.6f}  "
-                f"train_mse={train_mse_avg:.6f}  train_spec={train_spec_avg:.6f}  "
-                f"val_loss={val_loss:.6f}  val_mse={val_mse_avg:.6f}  val_spec={val_spec_avg:.6f}{best_marker}"
+                f"  train: total={train_loss['total']:.6f} mse={train_loss['mse']:.6f} spec={train_loss['spec']:.6f}  "
+                f"val: total={val_loss['total']:.6f} mse={val_loss['mse']:.6f} spec={val_loss['spec']:.6f}{best_marker}"
             )
 
             epoch_log_note = "best" if best_marker else ""
             if loss_log_path:
                 log_line = (
-                    f"{datetime.now().isoformat()} epoch={epoch} hybrid_loss={train_loss:.6f} "
-                    f"train_mse={train_mse_avg:.6f} train_spec={train_spec_avg:.6f} "
-                    f"val_loss={val_loss:.6f} val_mse={val_mse_avg:.6f} val_spec={val_spec_avg:.6f} {epoch_log_note}\n"
+                    f"{datetime.now().isoformat()} epoch={epoch} lr={current_lr:.2e} "
+                    f"train_total={train_loss['total']:.6f} train_mse={train_loss['mse']:.6f} train_spec={train_loss['spec']:.6f} "
+                    f"val_total={val_loss['total']:.6f} val_mse={val_loss['mse']:.6f} val_spec={val_loss['spec']:.6f} {epoch_log_note}\n"
                 )
                 with open(loss_log_path, "a", encoding="utf-8") as log_file:
                     log_file.write(log_line)
 
-        print("\nSaving loss curve …")
-        fig, ax = plt.subplots(figsize=(9, 4), facecolor="#111")
+        print("\nSaving loss curves …")
+        fig, axes = plt.subplots(1, 2, figsize=(14, 4), facecolor="#111")
+
+        # Total loss plot
+        ax = axes[0]
         ax.set_facecolor("#111")
-        ax.plot(range(1, EPOCHS + 1), train_losses, color="#00c8ff", linewidth=2, label="Train Hybrid Loss")
-        ax.plot(range(1, EPOCHS + 1), val_losses, color="#ff6b35", linewidth=2, label="Val Hybrid Loss")
+        ax.plot(range(1, len(train_losses['total']) + 1), train_losses['total'], color="#00c8ff", linewidth=2, label="Train Total")
+        ax.plot(range(1, len(val_losses['total']) + 1), val_losses['total'], color="#ff6b35", linewidth=2, label="Val Total")
         ax.set_xlabel("Epoch", color="white")
-        ax.set_ylabel("Hybrid Loss", color="white")
-        ax.set_title("PDE-Transformer - Karman Vortex Street", color="white", fontsize=13)
+        ax.set_ylabel("Total Loss", color="white")
+        ax.set_title("Total Loss", color="white", fontsize=11)
         ax.legend(framealpha=0.3)
         ax.tick_params(colors="white")
         ax.set_yscale("log")
         for spine in ax.spines.values():
             spine.set_edgecolor("#555")
+
+        # Spectral loss plot
+        ax = axes[1]
+        ax.set_facecolor("#111")
+        ax.plot(range(1, len(train_losses['spec']) + 1), train_losses['spec'], color="#00ff88", linewidth=2, label="Train Spectral")
+        ax.plot(range(1, len(val_losses['spec']) + 1), val_losses['spec'], color="#ffaa00", linewidth=2, label="Val Spectral")
+        ax.set_xlabel("Epoch", color="white")
+        ax.set_ylabel("Spectral Loss", color="white")
+        ax.set_title("Spectral Loss", color="white", fontsize=11)
+        ax.legend(framealpha=0.3)
+        ax.tick_params(colors="white")
+        ax.set_yscale("log")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#555")
+
         plt.tight_layout()
-        curve_path = os.path.join(OUT_DIR, "loss_curve.png")
+        curve_path = os.path.join(OUT_DIR, "loss_curves.png")
         plt.savefig(curve_path, dpi=150, facecolor="#111")
         plt.close()
         print(f"  Saved: {curve_path}")
@@ -753,34 +975,35 @@ def main():
     video_sim = val_sim_infos[0] if val_sim_infos else train_sim_infos[0]
     frame_path = save_rollout_video(model, video_sim, mean, std, zero_norm, get_labels, os.path.join(OUT_DIR, "pred_vs_gt.mp4"), "Final")
     if not SKIP_TRAIN:
-        print(f"\n{'=' * 60}")
+        print(f"\n{'=' * 80}")
         print("Training complete.")
-        print(f"  Best val loss : {best_val:.6f}")
+        print(f"  Best val loss  : {best_val:.6f}")
         if loss_log_path:
-            print(f"  Hybrid loss log : {loss_log_path}")
-        print(f"  Loss curve   : {OUT_DIR}/loss_curve.png")
-        print(f"  Prediction   : {frame_path}")
-        print(f"  Checkpoint   : {OUT_DIR}/last.ckpt")
-        print(f"{'=' * 60}\n")
+            print(f"  Loss log       : {loss_log_path}")
+        print(f"  Loss curves    : {OUT_DIR}/loss_curves.png")
+        print(f"  Prediction     : {frame_path}")
+        print(f"  Checkpoint     : {OUT_DIR}/last.ckpt")
+        print(f"{'=' * 80}\n")
         header = (
-            f"{'Epoch':>6}  {'Train Loss':>12}  {'Train MSE':>12}  {'Train Spec':>12}  "
-            f"{'Val Loss':>12}  {'Val MSE':>12}  {'Val Spec':>12}"
+            f"{'Epoch':>6}  {'Train Total':>12}  {'Train MSE':>12}  {'Train Spec':>12}  "
+            f"{'Val Total':>12}  {'Val MSE':>12}  {'Val Spec':>12}"
         )
         print(header)
         print("-" * len(header))
-        for epoch_idx, (hybrid, t_mse, t_spec, v_loss, v_mse, v_spec) in enumerate(
-            zip(train_losses, train_mse_terms, train_spec_terms, val_losses, val_mse_terms, val_spec_terms), 1
+        for epoch_idx, (t_tot, t_mse, t_spec, v_tot, v_mse, v_spec) in enumerate(
+            zip(train_losses['total'], train_losses['mse'], train_losses['spec'],
+                val_losses['total'], val_losses['mse'], val_losses['spec']), 1
         ):
             print(
-                f"{epoch_idx:>6}  {hybrid:>12.6f}  {t_mse:>12.6f}  {t_spec:>12.6f}  {v_loss:>12.6f}  "
-                f"{v_mse:>12.6f}  {v_spec:>12.6f}"
+                f"{epoch_idx:>6}  {t_tot:>12.6f}  {t_mse:>12.6f}  {t_spec:>12.6f}  "
+                f"{v_tot:>12.6f}  {v_mse:>12.6f}  {v_spec:>12.6f}"
             )
     else:
-        print(f"\n{'=' * 60}")
+        print(f"\n{'=' * 80}")
         print("Visualization complete.")
         print(f"  Prediction   : {frame_path}")
         print(f"  Checkpoint   : {OUT_DIR}/last.ckpt")
-        print(f"{'=' * 60}\n")
+        print(f"{'=' * 80}\n")
 
 
 if __name__ == "__main__":
