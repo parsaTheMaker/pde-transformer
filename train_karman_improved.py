@@ -80,16 +80,16 @@ np.random.seed(42)
 
 # User-editable configuration.
 # Use normal Python values here instead of environment variables.
-SIM_ROOT = "/home/vatani/data_vortex/256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
+SIM_ROOT = "./256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
 OUT_DIR = os.path.join("runs", "karman")
 EPOCHS = 40
 BATCH_SIZE = 28
 ACCUM_GRAD = 1
-LR = 5e-5
+LR = 4e-5
 VAL_FRAC = 0.10
 WARMUP_FRAC = 0.3
-MSE_LOSS_WEIGHT = 0.97
-SPEC_LOSS_WEIGHT = 0.03
+MSE_LOSS_WEIGHT = 1.0
+SPEC_LOSS_WEIGHT = 0.0
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
@@ -616,7 +616,7 @@ def main():
         print("  Device prefetch: enabled")
 
     optimizer = create_optimizer(model)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.2)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.25)
 
     task_label = torch.tensor([1000], dtype=torch.long, device=DEVICE)
 
