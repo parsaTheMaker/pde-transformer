@@ -93,6 +93,8 @@ WARMUP_FRAC = 0.3
 MSE_LOSS_WEIGHT = 0.99
 SPECTRAL_LOSS_WEIGHT = 0.01
 SPECTRAL_NUM_BINS = 12
+SPECTRAL_MASK_SMOOTH_PASSES = 3
+SPECTRAL_MASK_SMOOTH_KERNEL = 5
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
@@ -212,12 +214,26 @@ class ScaleNormalizedLogBSPLoss(nn.Module):
         [B, C, D, H, W]
     """
 
-    def __init__(self, mse_weight=0.95, spectral_weight=0.05, num_bins=12, eps=1e-6):
+    def __init__(
+        self,
+        mse_weight=0.95,
+        spectral_weight=0.05,
+        num_bins=12,
+        eps=1e-6,
+        mask_smooth_passes=3,
+        mask_smooth_kernel=5,
+    ):
         super().__init__()
         self.mse_weight = float(mse_weight)
         self.spectral_weight = float(spectral_weight)
         self.num_bins = int(num_bins)
         self.eps = float(eps)
+        self.mask_smooth_passes = int(mask_smooth_passes)
+        self.mask_smooth_kernel = int(mask_smooth_kernel)
+        if self.mask_smooth_kernel < 1 or self.mask_smooth_kernel % 2 == 0:
+            raise ValueError("mask_smooth_kernel must be a positive odd integer")
+        if self.mask_smooth_passes < 0:
+            raise ValueError("mask_smooth_passes must be >= 0")
         self._cache = {}
 
     def forward(self, pred, target, valid_mask=None):
@@ -235,11 +251,10 @@ class ScaleNormalizedLogBSPLoss(nn.Module):
 
     def _sn_log_bsp(self, pred, target, valid_mask=None):
         window, bin_idx = self._get_window_and_bins(pred)
-        valid_mask = self._prepare_valid_mask(valid_mask, pred)
+        spectral_mask = self._make_soft_spectral_mask(valid_mask, pred)
 
-        # Apply spatial window and domain-valid mask before FFT so masked regions
-        # do not contribute spectral energy.
-        taper = window * valid_mask
+        # Smooth mask edges before FFT to avoid obstacle-boundary spectral leakage.
+        taper = window * spectral_mask
         pred_w = pred * taper
         target_w = target * taper
 
@@ -262,6 +277,23 @@ class ScaleNormalizedLogBSPLoss(nn.Module):
 
         loss = torch.abs(torch.log((pred_bins + self.eps) / (target_bins + self.eps))).mean()
         return loss
+
+    def _make_soft_spectral_mask(self, valid_mask, x):
+        vm = self._prepare_valid_mask(valid_mask, x)
+        dims = x.ndim - 2
+        kernel = self.mask_smooth_kernel
+        padding = kernel // 2
+
+        if dims == 2:
+            for _ in range(self.mask_smooth_passes):
+                vm = F.avg_pool2d(vm, kernel_size=kernel, stride=1, padding=padding)
+        elif dims == 3:
+            for _ in range(self.mask_smooth_passes):
+                vm = F.avg_pool3d(vm, kernel_size=kernel, stride=1, padding=padding)
+        else:
+            raise ValueError(f"Unsupported spatial dims: {dims}")
+
+        return vm.clamp(0.0, 1.0)
 
     def _prepare_valid_mask(self, valid_mask, x):
         if valid_mask is None:
@@ -749,11 +781,14 @@ def main():
         spectral_weight=SPECTRAL_LOSS_WEIGHT,
         num_bins=SPECTRAL_NUM_BINS,
         eps=1e-6,
+        mask_smooth_passes=SPECTRAL_MASK_SMOOTH_PASSES,
+        mask_smooth_kernel=SPECTRAL_MASK_SMOOTH_KERNEL,
     ).to(DEVICE)
     print(f"\nLoss: ScaleNormalizedLogBSPLoss")
     print(f"  MSE weight: {loss_fn.mse_weight}")
     print(f"  Spectral weight: {loss_fn.spectral_weight}")
     print(f"  Spectral bins: {loss_fn.num_bins}")
+    print(f"  Spectral mask smoothing: passes={loss_fn.mask_smooth_passes}, kernel={loss_fn.mask_smooth_kernel}")
     if abs((loss_fn.mse_weight + loss_fn.spectral_weight) - 1.0) > 1e-6:
         print(f"  WARNING: loss weights sum to {loss_fn.mse_weight + loss_fn.spectral_weight:.4f}, not 1.0")
 
