@@ -179,5 +179,9 @@ wandb/
 *.json
 karman.py
 
-runs/
+*.ckpt
+*.txt
+*.gif
+*.gitignore
+*.npy
 .codex

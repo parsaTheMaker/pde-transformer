@@ -22,13 +22,14 @@ import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from matplotlib.colors import Normalize
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 import transformers
-from sim_cache import discover_simulations, ensure_all_sim_caches, load_npz_array, load_packed_array
+from sim_cache import discover_simulations, ensure_all_sim_caches, load_packed_array
 
 
 if os.name != "nt":
@@ -80,22 +81,27 @@ np.random.seed(42)
 
 # User-editable configuration.
 # Use normal Python values here instead of environment variables.
-SIM_ROOT = "/home/vatani/data_vortex/256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
+SIM_ROOT = "./256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
 OUT_DIR = os.path.join("runs", "karman")
 EPOCHS = 40
-BATCH_SIZE = 28
+BATCH_SIZE = 24
 ACCUM_GRAD = 1
-LR = 1e-5
+LR = 4e-5
 VAL_FRAC = 0.10
 WARMUP_FRAC = 0.3
-MSE_LOSS_WEIGHT = 0.95
-SPEC_LOSS_WEIGHT = 0.05
+# Loss configuration
+DIRECTION_LOSS_EPS = 1e-8
+DIRECTION_MASK_SMOOTH_PASSES = 0
+DIRECTION_MASK_SMOOTH_KERNEL = 5
+LOSS_WEIGHT_MSE = 1.0
+LOSS_WEIGHT_GRAD = 2.0
+LOSS_WEIGHT_DIRECTION = 0.02
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
 DPI_VID = 110
 SKIP_TRAIN = False
-RESUME_CHECKPOINT = "./runs/karman/last.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
+RESUME_CHECKPOINT = None #"./runs/karman/last.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
 MODEL_TYPE = "PDE-S"  # Smallest PDETransformer variant in this repo
 USE_AMP = DEVICE == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 # This model is attention-heavy and does many explicit permutes/window reshapes,
@@ -112,19 +118,6 @@ TQDM_UPDATE_EVERY = 20
 def packed_slice_to_numpy(array):
     return np.array(array, dtype=np.float32, copy=True)
 
-
-_HANN_WINDOW_CACHE = {}
-
-
-def get_hann_window2d(height, width, device, dtype):
-    key = (height, width, str(device), dtype)
-    window2d = _HANN_WINDOW_CACHE.get(key)
-    if window2d is None:
-        wy = torch.hann_window(height, periodic=False, device=device, dtype=dtype)
-        wx = torch.hann_window(width, periodic=False, device=device, dtype=dtype)
-        window2d = (wy[:, None] * wx[None, :]).unsqueeze(0).unsqueeze(0)
-        _HANN_WINDOW_CACHE[key] = window2d
-    return window2d
 
 def split_simulations(sim_infos, val_frac):
     if len(sim_infos) <= 1:
@@ -212,21 +205,139 @@ class MultiSimKarmanDataset(Dataset):
         return x.float(), y.float(), self._get_mask(sim_idx)
 
 
-def hybrid_spatial_spectral_loss(pred, target, eps=1e-6):
-    spatial_mse = F.mse_loss(pred, target)
-    height, width = pred.shape[-2:]
-    window2d = get_hann_window2d(height, width, pred.device, pred.dtype)
+class GradMagAndDirectionLoss(nn.Module):
+    def __init__(self, eps=1e-8, dir_tau=1e-4, use_smooth_dir_weight=True, mask_smooth_passes=3, mask_smooth_kernel=5):
+        super().__init__()
+        self.eps = float(eps)
+        self.dir_tau = float(dir_tau)
+        self.use_smooth_dir_weight = bool(use_smooth_dir_weight)
+        
+        self.mask_smooth_passes = int(mask_smooth_passes)
+        self.mask_smooth_kernel = int(mask_smooth_kernel)
 
-    pred_win = pred * window2d
-    target_win = target * window2d
-    pred_fft = torch.fft.rfft2(pred_win, dim=(-2, -1), norm="ortho")
-    target_fft = torch.fft.rfft2(target_win, dim=(-2, -1), norm="ortho")
-    diff_power = (pred_fft - target_fft).abs().pow(2)
-    target_power = target_fft.abs().pow(2)
-    spectral_loss = (diff_power / (target_power.detach() + eps)).mean()
+    def _prepare_mask(self, valid_mask, x):
+        if valid_mask is None:
+            return None
+        
+        vm = valid_mask.to(device=x.device, dtype=x.dtype)
+        if vm.ndim == x.ndim - 1:
+            vm = vm.unsqueeze(1)
+        if vm.ndim != x.ndim:
+            raise ValueError(f"Mask ndim {vm.ndim} incompatible with input ndim {x.ndim}")
+        if vm.shape[0] != x.shape[0] or vm.shape[2:] != x.shape[2:]:
+            raise ValueError(f"Mask shape {vm.shape} incompatible with input shape {x.shape}")
+            
+        if self.mask_smooth_passes > 0:
+            kernel = self.mask_smooth_kernel
+            padding = kernel // 2
+            if x.ndim == 4:
+                for _ in range(self.mask_smooth_passes):
+                    vm = F.avg_pool2d(vm, kernel_size=kernel, stride=1, padding=padding)
+            elif x.ndim == 5:
+                for _ in range(self.mask_smooth_passes):
+                    vm = F.avg_pool3d(vm, kernel_size=kernel, stride=1, padding=padding)
+        
+        vm = vm.clamp(0.0, 1.0)
+        if vm.shape[1] == 1 and x.shape[1] != 1:
+            vm = vm.expand(-1, x.shape[1], *x.shape[2:])
+        elif vm.shape[1] != x.shape[1]:
+            raise ValueError(f"Mask channels {vm.shape[1]} must be 1 or match input channels {x.shape[1]}")
+        return vm
 
-    total_loss = MSE_LOSS_WEIGHT * spatial_mse + SPEC_LOSS_WEIGHT * spectral_loss
-    return total_loss, spatial_mse.detach(), spectral_loss.detach()
+    def get_components(self, pred, target, valid_mask=None, spacing=None):
+        pred_grads = self._spatial_grads(pred, spacing=spacing)
+        target_grads = self._spatial_grads(target, spacing=spacing)
+
+        pred_g = torch.stack(pred_grads, dim=2)
+        target_g = torch.stack(target_grads, dim=2)
+
+        m = self._prepare_mask(valid_mask, pred)
+
+        # Gradient Magnitude / Sobolev term
+        grad_diff_sq = (pred_g - target_g).square().sum(dim=2)
+        if m is not None:
+            grad_loss = (grad_diff_sq * m).sum() / (m.sum() + self.eps)
+        else:
+            grad_loss = grad_diff_sq.mean()
+
+        # Gradient Direction term
+        dot = (pred_g * target_g).sum(dim=2)
+        pred_norm = torch.sqrt(pred_g.square().sum(dim=2) + self.eps)
+        target_norm = torch.sqrt(target_g.square().sum(dim=2) + self.eps)
+
+        cos = dot / (pred_norm * target_norm + self.eps)
+        dir_loss_pointwise = 1.0 - cos
+
+        if self.use_smooth_dir_weight:
+            w_dir = target_norm / (target_norm + self.dir_tau)
+        else:
+            w_dir = (target_norm > self.dir_tau).to(dtype=pred.dtype)
+
+        if m is not None:
+            w = w_dir * m
+            dir_loss = (dir_loss_pointwise * w).sum() / (w.sum() + self.eps)
+        else:
+            dir_loss = (dir_loss_pointwise * w_dir).sum() / (w_dir.sum() + self.eps)
+
+        return grad_loss, dir_loss
+
+    def grad_only(self, pred, target, valid_mask=None, spacing=None):
+        grad_loss, _ = self.get_components(pred, target, valid_mask, spacing)
+        return grad_loss
+
+    def direction_only(self, pred, target, valid_mask=None, spacing=None):
+        _, dir_loss = self.get_components(pred, target, valid_mask, spacing)
+        return dir_loss
+
+    def _spatial_grads(self, x: torch.Tensor, spacing=None):
+        if x.ndim == 4:
+            return self._grads_2d(x, spacing)
+        elif x.ndim == 5:
+            return self._grads_3d(x, spacing)
+        raise ValueError("Expected [B, C, H, W] or [B, C, D, H, W]")
+
+    def _grads_2d(self, x: torch.Tensor, spacing=None):
+        if spacing is None:
+            dy, dx = 1.0, 1.0
+        else:
+            dy, dx = float(spacing[0]), float(spacing[1])
+
+        gy = torch.empty_like(x)
+        gx = torch.empty_like(x)
+
+        gy[:, :, 1:-1, :] = (x[:, :, 2:, :] - x[:, :, :-2, :]) / (2.0 * dy)
+        gy[:, :, 0, :] = (x[:, :, 1, :] - x[:, :, 0, :]) / dy
+        gy[:, :, -1, :] = (x[:, :, -1, :] - x[:, :, -2, :]) / dy
+
+        gx[:, :, :, 1:-1] = (x[:, :, :, 2:] - x[:, :, :, :-2]) / (2.0 * dx)
+        gx[:, :, :, 0] = (x[:, :, :, 1] - x[:, :, :, 0]) / dx
+        gx[:, :, :, -1] = (x[:, :, :, -1] - x[:, :, :, -2]) / dx
+
+        return gy, gx
+
+    def _grads_3d(self, x: torch.Tensor, spacing=None):
+        if spacing is None:
+            dz, dy, dx = 1.0, 1.0, 1.0
+        else:
+            dz, dy, dx = float(spacing[0]), float(spacing[1]), float(spacing[2])
+
+        gz = torch.empty_like(x)
+        gy = torch.empty_like(x)
+        gx = torch.empty_like(x)
+
+        gz[:, :, 1:-1, :, :] = (x[:, :, 2:, :, :] - x[:, :, :-2, :, :]) / (2.0 * dz)
+        gz[:, :, 0, :, :] = (x[:, :, 1, :, :] - x[:, :, 0, :, :]) / dz
+        gz[:, :, -1, :, :] = (x[:, :, -1, :, :] - x[:, :, -2, :, :]) / dz
+
+        gy[:, :, :, 1:-1, :] = (x[:, :, :, 2:, :] - x[:, :, :, :-2, :]) / (2.0 * dy)
+        gy[:, :, :, 0, :] = (x[:, :, :, 1, :] - x[:, :, :, 0, :]) / dy
+        gy[:, :, :, -1, :] = (x[:, :, :, -1, :] - x[:, :, :, -2, :]) / dy
+
+        gx[:, :, :, :, 1:-1] = (x[:, :, :, :, 2:] - x[:, :, :, :, :-2]) / (2.0 * dx)
+        gx[:, :, :, :, 0] = (x[:, :, :, :, 1] - x[:, :, :, :, 0]) / dx
+        gx[:, :, :, :, -1] = (x[:, :, :, :, -1] - x[:, :, :, :, -2]) / dx
+
+        return gz, gy, gx
 
 
 def build_loader(dataset, shuffle):
@@ -330,7 +441,7 @@ def get_model():
 def create_optimizer(model):
     adamw_kwargs = {
         "lr": LR,
-        "weight_decay": 1e-2,
+        "weight_decay": 1e-6,
         "foreach": torch.cuda.is_available(),
     }
     if torch.cuda.is_available():
@@ -353,11 +464,19 @@ def move_batch_to_device(x, y, mask):
     return x, y, mask
 
 
-def update_progress(progress_bar, total_loss_sum, mse_sum, spec_sum, sample_count):
+def update_progress(progress_bar, loss_dict, sample_count):
+    denom = max(1, sample_count)
+    avg_loss_dict = {}
+    for key, value in loss_dict.items():
+        avg = value / denom
+        if isinstance(avg, torch.Tensor):
+            avg = avg.detach().item()
+        avg_loss_dict[key] = avg
     progress_bar.set_postfix(
-        tot=f"{total_loss_sum / max(1, sample_count):.6f}",
-        mse=f"{mse_sum / max(1, sample_count):.6f}",
-        sp=f"{spec_sum / max(1, sample_count):.6f}",
+        mse=f"{avg_loss_dict['mse']:.6f}",
+        grad=f"{avg_loss_dict['grad']:.6f}",
+        dir=f"{avg_loss_dict['direction']:.6f}",
+        combo=f"{avg_loss_dict['combo']:.6f}"
     )
 
 
@@ -371,6 +490,33 @@ def build_checkpoint(model, optimizer, scheduler, epoch, best_metric, train_loss
         "train_losses": train_losses,
         "val_losses": val_losses,
     }
+
+
+def normalize_loss_history(losses):
+    normalized = {"mse": [], "grad": [], "direction": [], "combo": []}
+    if not isinstance(losses, dict):
+        return normalized
+
+    mse_hist = list(losses.get("mse", []))
+    grad_hist = list(losses.get("grad", []))
+    direction_hist = list(losses.get("direction", []))
+    combo_hist = list(losses.get("combo", []))
+
+    length = max(len(mse_hist), len(grad_hist), len(direction_hist), len(combo_hist))
+    for key, hist in (("mse", mse_hist), ("grad", grad_hist), ("direction", direction_hist), ("combo", combo_hist)):
+        if len(hist) < length:
+            hist.extend([float("nan")] * (length - len(hist)))
+        normalized[key] = hist
+
+    for idx in range(length):
+        if math.isnan(normalized["combo"][idx]):
+            normalized["combo"][idx] = (
+                LOSS_WEIGHT_MSE * normalized["mse"][idx]
+                + LOSS_WEIGHT_GRAD * normalized["grad"][idx]
+                + LOSS_WEIGHT_DIRECTION * normalized["direction"][idx]
+            )
+
+    return normalized
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, best_metric, train_losses, val_losses):
@@ -387,12 +533,15 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        t_losses = normalize_loss_history(checkpoint.get("train_losses"))
+        v_losses = normalize_loss_history(checkpoint.get("val_losses"))
+
         return {
             "resumed": True,
             "saved_epoch": saved_epoch,
             "best_val": float(checkpoint.get("best_val", math.inf)),
-            "train_losses": list(checkpoint.get("train_losses", [])),
-            "val_losses": list(checkpoint.get("val_losses", [])),
+            "train_losses": t_losses,
+            "val_losses": v_losses,
         }
 
     if isinstance(checkpoint, dict):
@@ -401,25 +550,45 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
             "resumed": False,
             "saved_epoch": None,
             "best_val": math.inf,
-            "train_losses": [],
-            "val_losses": [],
+            "train_losses": {"mse": [], "grad": [], "direction": [], "combo": []},
+            "val_losses": {"mse": [], "grad": [], "direction": [], "combo": []},
         }
 
     raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")
 
 
-def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None):
+def fast_get_gradient_vector(network):
+    """Optimized method to extract gradients without creating O(N) memory fragments."""
+    with torch.no_grad():
+        grads = [par.grad.data.view(-1) for par in network.parameters() if par.grad is not None]
+        return torch.cat(grads) if grads else None
+
+
+def sanitize_gradient_vector(grad_vec):
+    """Return a finite gradient vector or None if no usable gradient exists."""
+    if grad_vec is None:
+        return None
+    if torch.isfinite(grad_vec).all():
+        return grad_vec
+    return torch.nan_to_num(grad_vec, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimizer=None, operator=None, global_step=0):
     if training:
         model.train()
         optimizer.zero_grad(set_to_none=True)
+        from conflictfree.utils import apply_gradient_vector
         desc = "tr"
     else:
         model.eval()
         desc = "va"
 
-    loss_sum = 0.0
-    mse_sum = 0.0
-    spec_sum = 0.0
+    loss_accum = {
+        "mse": torch.zeros((), device=DEVICE),
+        "grad": torch.zeros((), device=DEVICE),
+        "direction": torch.zeros((), device=DEVICE),
+        "combo": torch.zeros((), device=DEVICE),
+    }
     sample_count = 0
 
     context = torch.enable_grad if training else torch.inference_mode
@@ -434,28 +603,94 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None)
             pred = pred.float()
             pred = torch.lerp(zero_norm, pred, mask)
 
-            raw_loss, mse_term, spec_term = hybrid_spatial_spectral_loss(pred, y)
+            if training:
+                idx = (global_step + step) % 3
+                if idx == 0:
+                    mse_loss = F.mse_loss(pred, y)
+                    loss_to_backprop = mse_loss * LOSS_WEIGHT_MSE
+                    with torch.no_grad():
+                        grad_loss, dir_loss = loss_fn.get_components(pred.detach(), y, valid_mask=mask)
+                elif idx == 1:
+                    grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
+                    loss_to_backprop = grad_loss * LOSS_WEIGHT_GRAD
+                    with torch.no_grad():
+                        mse_loss = F.mse_loss(pred, y)
+                    dir_loss = dir_loss.detach()
+                else:
+                    grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
+                    loss_to_backprop = dir_loss * LOSS_WEIGHT_DIRECTION
+                    with torch.no_grad():
+                        mse_loss = F.mse_loss(pred, y)
+                    grad_loss = grad_loss.detach()
+            else:
+                mse_loss = F.mse_loss(pred, y)
+                grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
 
             if training:
-                (raw_loss / ACCUM_GRAD).backward()
+                if step % ACCUM_GRAD != 0:
+                    accum_grad = sanitize_gradient_vector(fast_get_gradient_vector(model))
+                else:
+                    accum_grad = None
+
+                optimizer.zero_grad(set_to_none=True)
+                
+                (loss_to_backprop / ACCUM_GRAD).backward()
+                
+                grad = sanitize_gradient_vector(fast_get_gradient_vector(model))
+                if grad is None:
+                    continue
+
+                try:
+                    g_config = operator.calculate_gradient(idx, grad)
+                except torch._C._LinAlgError:
+                    # Fallback: use the current finite gradient if ConFIG fails numerically.
+                    g_config = grad
+                except RuntimeError as err:
+                    msg = str(err).lower()
+                    if "cusolver" in msg or "lstsq" in msg or "nan" in msg:
+                        g_config = grad
+                    else:
+                        raise
+
+                g_config = sanitize_gradient_vector(g_config)
+                if g_config is None:
+                    continue
+                
+                if accum_grad is not None:
+                    g_config = accum_grad + g_config
+                    
+                apply_gradient_vector(model, g_config)
+                
+                del grad, g_config
+
                 if (step + 1) % ACCUM_GRAD == 0 or (step + 1) == len(loader):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
             batch_size = x.shape[0]
-            loss_sum += raw_loss.item() * batch_size
-            mse_sum += mse_term.item() * batch_size
-            spec_sum += spec_term.item() * batch_size
+            loss_accum["mse"] += mse_loss.detach() * batch_size
+            loss_accum["grad"] += grad_loss.detach() * batch_size
+            loss_accum["direction"] += dir_loss.detach() * batch_size
+            
+            # combo tracking
+            combo_val = (
+                mse_loss.detach() * LOSS_WEIGHT_MSE
+                + grad_loss.detach() * LOSS_WEIGHT_GRAD
+                + dir_loss.detach() * LOSS_WEIGHT_DIRECTION
+            )
+            loss_accum["combo"] += combo_val * batch_size
+            
             sample_count += batch_size
             if step == 0 or (step + 1) % TQDM_UPDATE_EVERY == 0 or (step + 1) == len(loader):
-                update_progress(progress_bar, loss_sum, mse_sum, spec_sum, sample_count)
+                update_progress(progress_bar, loss_accum, sample_count)
 
-    return (
-        loss_sum / max(1, sample_count),
-        mse_sum / max(1, sample_count),
-        spec_sum / max(1, sample_count),
-    )
+    return {
+        "mse": (loss_accum["mse"] / max(1, sample_count)).detach().item(),
+        "grad": (loss_accum["grad"] / max(1, sample_count)).detach().item(),
+        "direction": (loss_accum["direction"] / max(1, sample_count)).detach().item(),
+        "combo": (loss_accum["combo"] / max(1, sample_count)).detach().item(),
+    }
 
 
 def save_rollout_video(model_to_render, sim_info, mean, std, zero_norm, get_labels_fn, out_path, title_tag):
@@ -616,19 +851,32 @@ def main():
         print("  Device prefetch: enabled")
 
     optimizer = create_optimizer(model)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.25)
+
+    # Build loss function
+    loss_fn = GradMagAndDirectionLoss(
+        eps=DIRECTION_LOSS_EPS,
+        mask_smooth_passes=DIRECTION_MASK_SMOOTH_PASSES,
+        mask_smooth_kernel=DIRECTION_MASK_SMOOTH_KERNEL,
+    ).to(DEVICE)
+    print(f"\nLoss: GradMagAndDirectionLoss")
+    print(f"  Direction mask smoothing: passes={loss_fn.mask_smooth_passes}, kernel={loss_fn.mask_smooth_kernel}")
+    print(
+        "  Combo weights: "
+        f"mse={LOSS_WEIGHT_MSE:g}, grad={LOSS_WEIGHT_GRAD:g}, dir={LOSS_WEIGHT_DIRECTION:g}"
+    )
 
     task_label = torch.tensor([1000], dtype=torch.long, device=DEVICE)
 
     def get_labels(batch_size):
         return task_label.expand(batch_size)
 
-    train_losses = []
-    val_losses = []
-    train_mse_terms = []
-    train_spec_terms = []
-    val_mse_terms = []
-    val_spec_terms = []
+    from conflictfree.momentum_operator import PseudoMomentumOperator
+    operator = PseudoMomentumOperator(num_vectors=3)
+    global_step = 0
+
+    train_losses = {"mse": [], "grad": [], "direction": [], "combo": []}
+    val_losses = {"mse": [], "grad": [], "direction": [], "combo": []}
     best_val = math.inf
     loss_log_path = None
     start_epoch = 1
@@ -653,44 +901,58 @@ def main():
             print("Successfully loaded model weights from checkpoint; optimizer/scheduler state not found.")
 
     if not SKIP_TRAIN:
-        loss_log_path = os.path.join(OUT_DIR, f"hybrid_loss_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        loss_log_path = os.path.join(OUT_DIR, f"loss_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
         with open(loss_log_path, "w", encoding="utf-8") as log_file:
-            log_file.write("timestamp epoch hybrid_loss train_mse train_spec val_loss val_mse val_spec best\n")
+            log_file.write(
+                "timestamp epoch lr "
+                "train_mse train_grad train_direction train_combo "
+                "val_mse val_grad val_direction val_combo best\n"
+            )
 
         for epoch in range(start_epoch, EPOCHS + 1):
-            train_loss, train_mse_avg, train_spec_avg = run_epoch(
+            # Print current learning rate
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"\nEpoch {epoch:02d}/{EPOCHS}  LR: {current_lr:.2e}")
+
+            train_loss = run_epoch(
                 model=model,
                 loader=train_loader,
                 zero_norm=zero_norm,
                 get_labels_fn=get_labels,
+                loss_fn=loss_fn,
                 training=True,
                 optimizer=optimizer,
+                operator=operator,
+                global_step=global_step,
             )
+            global_step += len(train_loader)
 
             if val_loader is None:
-                val_loss = float("inf")
-                val_mse_avg = float("nan")
-                val_spec_avg = float("nan")
+                val_loss = {"mse": float("nan"), "grad": float("nan"), "direction": float("nan"), "combo": float("nan")}
             else:
-                val_loss, val_mse_avg, val_spec_avg = run_epoch(
+                val_loss = run_epoch(
                     model=model,
                     loader=val_loader,
                     zero_norm=zero_norm,
                     get_labels_fn=get_labels,
+                    loss_fn=loss_fn,
                     training=False,
                 )
 
             scheduler.step()
-            train_losses.append(train_loss)
-            val_losses.append(val_loss)
-            train_mse_terms.append(train_mse_avg)
-            train_spec_terms.append(train_spec_avg)
-            val_mse_terms.append(val_mse_avg)
-            val_spec_terms.append(val_spec_avg)
+            train_losses["mse"].append(train_loss["mse"])
+            train_losses["grad"].append(train_loss["grad"])
+            train_losses["direction"].append(train_loss["direction"])
+            train_losses["combo"].append(train_loss["combo"])
+            
+            val_losses["mse"].append(val_loss["mse"])
+            val_losses["grad"].append(val_loss["grad"])
+            val_losses["direction"].append(val_loss["direction"])
+            val_losses["combo"].append(val_loss["combo"])
 
-            if val_loss < best_val:
-                best_val = val_loss
-                best_marker = " ← best"
+            if val_loss["combo"] < best_val:
+                best_val = val_loss["combo"]
+                best_marker = " ← best combo"
             else:
                 best_marker = ""
 
@@ -702,36 +964,82 @@ def main():
                 save_rollout_video(model, video_sim, mean, std, zero_norm, get_labels, epoch_video_path, f"Epoch {epoch:03d}")
 
             print(
-                f"Epoch {epoch:02d}/{EPOCHS}  comprehensive_loss={train_loss:.6f}  "
-                f"train_mse={train_mse_avg:.6f}  train_spec={train_spec_avg:.6f}  "
-                f"val_loss={val_loss:.6f}  val_mse={val_mse_avg:.6f}  val_spec={val_spec_avg:.6f}{best_marker}"
+                f"  train: mse={train_loss['mse']:.6f} grad={train_loss['grad']:.6f} dir={train_loss['direction']:.6f} combo={train_loss['combo']:.6f}  "
+                f"val: mse={val_loss['mse']:.6f} grad={val_loss['grad']:.6f} dir={val_loss['direction']:.6f} combo={val_loss['combo']:.6f}{best_marker}"
             )
 
             epoch_log_note = "best" if best_marker else ""
             if loss_log_path:
                 log_line = (
-                    f"{datetime.now().isoformat()} epoch={epoch} hybrid_loss={train_loss:.6f} "
-                    f"train_mse={train_mse_avg:.6f} train_spec={train_spec_avg:.6f} "
-                    f"val_loss={val_loss:.6f} val_mse={val_mse_avg:.6f} val_spec={val_spec_avg:.6f} {epoch_log_note}\n"
+                    f"{datetime.now().isoformat()} epoch={epoch} lr={current_lr:.2e} "
+                    f"train_mse={train_loss['mse']:.6f} train_grad={train_loss['grad']:.6f} train_dir={train_loss['direction']:.6f} train_combo={train_loss['combo']:.6f} "
+                    f"val_mse={val_loss['mse']:.6f} val_grad={val_loss['grad']:.6f} val_dir={val_loss['direction']:.6f} val_combo={val_loss['combo']:.6f} {epoch_log_note}\n"
                 )
                 with open(loss_log_path, "a", encoding="utf-8") as log_file:
                     log_file.write(log_line)
 
-        print("\nSaving loss curve …")
-        fig, ax = plt.subplots(figsize=(9, 4), facecolor="#111")
+        print("\nSaving loss curves …")
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10), facecolor="#111")
+        axes = axes.ravel()
+        
+        # Combo loss plot
+        ax = axes[0]
         ax.set_facecolor("#111")
-        ax.plot(range(1, EPOCHS + 1), train_losses, color="#00c8ff", linewidth=2, label="Train Hybrid Loss")
-        ax.plot(range(1, EPOCHS + 1), val_losses, color="#ff6b35", linewidth=2, label="Val Hybrid Loss")
+        ax.plot(range(1, len(train_losses['combo']) + 1), train_losses['combo'], color="#aa88ff", linewidth=2, label="Train Combo")
+        ax.plot(range(1, len(val_losses['combo']) + 1), val_losses['combo'], color="#ff6b35", linewidth=2, label="Val Combo")
         ax.set_xlabel("Epoch", color="white")
-        ax.set_ylabel("Hybrid Loss", color="white")
-        ax.set_title("PDE-Transformer - Karman Vortex Street", color="white", fontsize=13)
+        ax.set_ylabel("Loss", color="white")
+        ax.set_title("Combo Weighted Loss", color="white", fontsize=11)
         ax.legend(framealpha=0.3)
         ax.tick_params(colors="white")
         ax.set_yscale("log")
         for spine in ax.spines.values():
             spine.set_edgecolor("#555")
+            
+        # MSE loss plot
+        ax = axes[1]
+        ax.set_facecolor("#111")
+        ax.plot(range(1, len(train_losses['mse']) + 1), train_losses['mse'], color="#00c8ff", linewidth=2, label="Train MSE")
+        ax.plot(range(1, len(val_losses['mse']) + 1), val_losses['mse'], color="#ffaa00", linewidth=2, label="Val MSE")
+        ax.set_xlabel("Epoch", color="white")
+        ax.set_ylabel("MSE Loss", color="white")
+        ax.set_title("MSE Loss", color="white", fontsize=11)
+        ax.legend(framealpha=0.3)
+        ax.tick_params(colors="white")
+        ax.set_yscale("log")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#555")
+
+        # Grad loss plot
+        ax = axes[2]
+        ax.set_facecolor("#111")
+        ax.plot(range(1, len(train_losses['grad']) + 1), train_losses['grad'], color="#ff33cc", linewidth=2, label="Train Grad")
+        ax.plot(range(1, len(val_losses['grad']) + 1), val_losses['grad'], color="#ffaa00", linewidth=2, label="Val Grad")
+        ax.set_xlabel("Epoch", color="white")
+        ax.set_ylabel("Grad Magnitude Loss", color="white")
+        ax.set_title("Grad Magnitude Loss", color="white", fontsize=11)
+        ax.legend(framealpha=0.3)
+        ax.tick_params(colors="white")
+        ax.set_yscale("log")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#555")
+
+        # Direction loss plot
+        ax = axes[3]
+        ax.set_facecolor("#111")
+        ax.plot(range(1, len(train_losses['direction']) + 1), train_losses['direction'], color="#00ff88", linewidth=2, label="Train Direction")
+        ax.plot(range(1, len(val_losses['direction']) + 1), val_losses['direction'], color="#ffafcc", linewidth=2, label="Val Direction")
+        ax.set_xlabel("Epoch", color="white")
+        ax.set_ylabel("Direction Loss", color="white")
+        ax.set_title("Direction Loss", color="white", fontsize=11)
+        ax.legend(framealpha=0.3)
+        ax.tick_params(colors="white")
+        ax.set_yscale("log")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#555")
+
         plt.tight_layout()
-        curve_path = os.path.join(OUT_DIR, "loss_curve.png")
+        curve_path = os.path.join(OUT_DIR, "loss_curves.png")
         plt.savefig(curve_path, dpi=150, facecolor="#111")
         plt.close()
         print(f"  Saved: {curve_path}")
@@ -753,34 +1061,34 @@ def main():
     video_sim = val_sim_infos[0] if val_sim_infos else train_sim_infos[0]
     frame_path = save_rollout_video(model, video_sim, mean, std, zero_norm, get_labels, os.path.join(OUT_DIR, "pred_vs_gt.mp4"), "Final")
     if not SKIP_TRAIN:
-        print(f"\n{'=' * 60}")
+        print(f"\n{'=' * 80}")
         print("Training complete.")
-        print(f"  Best val loss : {best_val:.6f}")
+        print(f"  Best val combo : {best_val:.6f}")
         if loss_log_path:
-            print(f"  Hybrid loss log : {loss_log_path}")
-        print(f"  Loss curve   : {OUT_DIR}/loss_curve.png")
-        print(f"  Prediction   : {frame_path}")
-        print(f"  Checkpoint   : {OUT_DIR}/last.ckpt")
-        print(f"{'=' * 60}\n")
+            print(f"  Loss log       : {loss_log_path}")
+        print(f"  Loss curves    : {OUT_DIR}/loss_curves.png")
+        print(f"  Prediction     : {frame_path}")
+        print(f"  Checkpoint     : {OUT_DIR}/last.ckpt")
+        print(f"{'=' * 80}\n")
         header = (
-            f"{'Epoch':>6}  {'Train Loss':>12}  {'Train MSE':>12}  {'Train Spec':>12}  "
-            f"{'Val Loss':>12}  {'Val MSE':>12}  {'Val Spec':>12}"
+            f"{'Epoch':>6}  {'Train Combo':>13}  {'Val Combo':>13}  "
+            f"{'Train MSE':>11}  {'Val MSE':>11}"
         )
         print(header)
         print("-" * len(header))
-        for epoch_idx, (hybrid, t_mse, t_spec, v_loss, v_mse, v_spec) in enumerate(
-            zip(train_losses, train_mse_terms, train_spec_terms, val_losses, val_mse_terms, val_spec_terms), 1
+        for epoch_idx, (t_c, v_c, t_m, v_m) in enumerate(
+            zip(train_losses['combo'], val_losses['combo'], train_losses['mse'], val_losses['mse']), 1
         ):
             print(
-                f"{epoch_idx:>6}  {hybrid:>12.6f}  {t_mse:>12.6f}  {t_spec:>12.6f}  {v_loss:>12.6f}  "
-                f"{v_mse:>12.6f}  {v_spec:>12.6f}"
+                f"{epoch_idx:>6}  {t_c:>13.6f}  {v_c:>13.6f}  "
+                f"{t_m:>11.6f}  {v_m:>11.6f}"
             )
     else:
-        print(f"\n{'=' * 60}")
+        print(f"\n{'=' * 80}")
         print("Visualization complete.")
         print(f"  Prediction   : {frame_path}")
         print(f"  Checkpoint   : {OUT_DIR}/last.ckpt")
-        print(f"{'=' * 60}\n")
+        print(f"{'=' * 80}\n")
 
 
 if __name__ == "__main__":
