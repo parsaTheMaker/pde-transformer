@@ -81,14 +81,14 @@ np.random.seed(42)
 
 # User-editable configuration.
 # Use normal Python values here instead of environment variables.
-SIM_ROOT = "./256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
+SIM_ROOT = "/home/vatani/data_vortex/256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
 OUT_DIR = os.path.join("runs", "karman")
 EPOCHS = 40
 BATCH_SIZE = 24
 ACCUM_GRAD = 1
 LR = 4e-5
 VAL_FRAC = 0.10
-WARMUP_FRAC = 0.3
+WARMUP_FRAC = 0.5
 # Loss configuration
 DIRECTION_LOSS_EPS = 1e-8
 DIRECTION_MASK_SMOOTH_PASSES = 0
@@ -101,7 +101,7 @@ FPS_VID = 10
 VID_FRAMES = 50
 DPI_VID = 110
 SKIP_TRAIN = False
-RESUME_CHECKPOINT = None #"./runs/karman/last.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
+RESUME_CHECKPOINT = "./runs/karman/last.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
 MODEL_TYPE = "PDE-S"  # Smallest PDETransformer variant in this repo
 USE_AMP = DEVICE == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 # This model is attention-heavy and does many explicit permutes/window reshapes,

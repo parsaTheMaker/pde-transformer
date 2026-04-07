@@ -104,7 +104,7 @@ np.random.seed(42)
 
 # User-editable configuration.
 # Use normal Python values here instead of environment variables.
-SIM_ROOT = "./256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
+SIM_ROOT = "/home/vatani/data_vortex/256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
 OUT_DIR = os.path.join("runs", "karman_finetuned")
 EPOCHS = 40
 BATCH_SIZE = 20
