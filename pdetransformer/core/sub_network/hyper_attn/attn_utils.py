@@ -8,7 +8,10 @@ try:
 except ImportError:
     flash_attn_func_cuda = None
 
-from .flash_attn_triton_for_hyper import flash_attn_func
+try:
+    from .flash_attn_triton_for_hyper import flash_attn_func
+except ImportError:
+    flash_attn_func = None
 
 
 def indexing(x, indices, chunk_size=-1):

@@ -141,14 +141,19 @@ class AttentionBlock(nn.Module):
             qkv[2],
         )  # make torchscript happy (cannot use tensor as tuple)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
         if self.use_mask:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn * torch.sigmoid(self.att_mask).expand(B, -1, -1, -1)
-
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        else:
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, 
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+                scale=self.scale
+            )
+            x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
