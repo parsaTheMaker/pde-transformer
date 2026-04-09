@@ -94,14 +94,14 @@ DIRECTION_LOSS_EPS = 1e-8
 DIRECTION_MASK_SMOOTH_PASSES = 0
 DIRECTION_MASK_SMOOTH_KERNEL = 5
 LOSS_WEIGHT_MSE = 1.0
-LOSS_WEIGHT_GRAD = 2.0
-LOSS_WEIGHT_DIRECTION = 0.02
+LOSS_WEIGHT_GRAD = 0.0
+LOSS_WEIGHT_DIRECTION = 0.00
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
 DPI_VID = 110
 SKIP_TRAIN = False
-RESUME_CHECKPOINT = "./runs/karman/last.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
+RESUME_CHECKPOINT = "./runs/karman/last_mse_only.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
 MODEL_TYPE = "PDE-S"  # Smallest PDETransformer variant in this repo
 USE_AMP = DEVICE == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 # This model is attention-heavy and does many explicit permutes/window reshapes,
