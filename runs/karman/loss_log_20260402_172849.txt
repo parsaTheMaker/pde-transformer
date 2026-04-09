@@ -1,1 +1,0 @@
-timestamp epoch lr train_total train_mse train_spec val_total val_mse val_spec best
