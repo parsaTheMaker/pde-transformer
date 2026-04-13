@@ -81,10 +81,10 @@ np.random.seed(42)
 
 # User-editable configuration.
 # Use normal Python values here instead of environment variables.
-SIM_ROOT = "/home/vatani/data_vortex/256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
+SIM_ROOT = "./256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
 OUT_DIR = os.path.join("runs", "karman")
 EPOCHS = 40
-BATCH_SIZE = 12
+BATCH_SIZE = 32
 ACCUM_GRAD = 1
 LR = 4e-5
 VAL_FRAC = 0.10
@@ -94,8 +94,8 @@ DIRECTION_LOSS_EPS = 1e-8
 DIRECTION_MASK_SMOOTH_PASSES = 0
 DIRECTION_MASK_SMOOTH_KERNEL = 5
 LOSS_WEIGHT_MSE = 1.0
-LOSS_WEIGHT_GRAD = 2.0
-LOSS_WEIGHT_DIRECTION = 0.0
+LOSS_WEIGHT_GRAD = 0.0
+LOSS_WEIGHT_DIRECTION = 0.02
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
@@ -219,7 +219,7 @@ class MultiSimKarmanDataset(Dataset):
         mask_t = self._mask_tensors.get(sim_idx)
         if mask_t is None:
             mask_np = packed_slice_to_numpy(load_packed_array(self.sims[sim_idx]["packed_mask_path"]))
-            mask_t = torch.from_numpy(mask_np).float()
+            mask_t = torch.from_numpy(mask_np).float().clamp_(0.0, 1.0)
             self._mask_tensors[sim_idx] = mask_t
         return mask_t
 
@@ -592,22 +592,6 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")
 
 
-def fast_get_gradient_vector(network):
-    """Optimized method to extract gradients without creating O(N) memory fragments."""
-    with torch.no_grad():
-        grads = [par.grad.data.view(-1) for par in network.parameters() if par.grad is not None]
-        return torch.cat(grads) if grads else None
-
-
-def sanitize_gradient_vector(grad_vec):
-    """Return a finite gradient vector or None if no usable gradient exists."""
-    if grad_vec is None:
-        return None
-    if torch.isfinite(grad_vec).all():
-        return grad_vec
-    return torch.nan_to_num(grad_vec, nan=0.0, posinf=0.0, neginf=0.0)
-
-
 def get_active_objectives():
     objectives = [
         ("mse", float(LOSS_WEIGHT_MSE)),
@@ -615,6 +599,38 @@ def get_active_objectives():
         ("direction", float(LOSS_WEIGHT_DIRECTION)),
     ]
     return [(name, weight) for name, weight in objectives if weight != 0.0]
+
+
+def prepare_fluid_mask(mask, ref_tensor):
+    if mask is None:
+        return None
+    fluid_mask = mask.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+    if fluid_mask.ndim == ref_tensor.ndim - 1:
+        fluid_mask = fluid_mask.unsqueeze(1)
+    if fluid_mask.ndim != ref_tensor.ndim:
+        raise ValueError(f"Mask ndim {fluid_mask.ndim} incompatible with tensor ndim {ref_tensor.ndim}.")
+    if fluid_mask.shape[0] != ref_tensor.shape[0] or fluid_mask.shape[2:] != ref_tensor.shape[2:]:
+        raise ValueError(f"Mask shape {fluid_mask.shape} incompatible with tensor shape {ref_tensor.shape}.")
+    return fluid_mask.clamp(0.0, 1.0)
+
+
+def apply_obstacle_constraints(field, zero_norm, fluid_mask):
+    if fluid_mask is None:
+        return field
+    return torch.lerp(zero_norm, field, fluid_mask)
+
+
+def masked_mse_loss(pred, target, fluid_mask, eps=1e-8):
+    if fluid_mask is None:
+        return F.mse_loss(pred, target)
+    if fluid_mask.shape[1] == 1 and pred.shape[1] != 1:
+        weights = fluid_mask.expand(-1, pred.shape[1], *pred.shape[2:])
+    elif fluid_mask.shape[1] == pred.shape[1]:
+        weights = fluid_mask
+    else:
+        raise ValueError(f"Mask channels {fluid_mask.shape[1]} must be 1 or match tensor channels {pred.shape[1]}.")
+    diff_sq = (pred - target).square()
+    return (diff_sq * weights).sum() / (weights.sum() + eps)
 
 
 def run_epoch(
@@ -625,10 +641,7 @@ def run_epoch(
     loss_fn,
     training,
     optimizer=None,
-    operator=None,
-    global_step=0,
     active_objectives=None,
-    apply_gradient_fn=None,
 ):
     if active_objectives is None:
         active_objectives = get_active_objectives()
@@ -636,19 +649,14 @@ def run_epoch(
     if training and not active_objectives:
         raise ValueError("All loss weights are zero; at least one training objective must be active.")
 
-    objective_names = [name for name, _ in active_objectives] if active_objectives else ["mse", "grad", "direction"]
     objective_weight_map = {name: weight for name, weight in active_objectives}
 
     if training:
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        use_multi_objective = operator is not None and len(active_objectives) > 1
-        if use_multi_objective and apply_gradient_fn is None:
-            raise ValueError("apply_gradient_fn is required when multi-objective mode is active.")
         desc = "tr"
     else:
         model.eval()
-        use_multi_objective = False
         desc = "va"
 
     use_accumulation = ACCUM_GRAD > 1
@@ -667,74 +675,30 @@ def run_epoch(
         for step, (x, y, mask) in enumerate(progress_bar):
             x, y, mask = move_batch_to_device(x, y, mask)
             labels = get_labels_fn(x.shape[0])
+            fluid_mask = prepare_fluid_mask(mask, y)
 
             pred = safe_model_sample(model, x, labels)
             pred = pred.float()
-            pred = torch.lerp(zero_norm, pred, mask)
+            pred = apply_obstacle_constraints(pred, zero_norm, fluid_mask)
+            y = apply_obstacle_constraints(y, zero_norm, fluid_mask)
+
+            if not torch.isfinite(pred).all() or not torch.isfinite(y).all():
+                raise RuntimeError("Non-finite values detected in prediction/target tensors.")
 
             if training:
-                idx = (global_step + step) % len(objective_names)
-                active_name = objective_names[idx]
-
-                if active_name == "mse":
-                    mse_loss = F.mse_loss(pred, y)
-                    loss_to_backprop = mse_loss * objective_weight_map["mse"]
-                    with torch.no_grad():
-                        grad_loss, dir_loss = loss_fn.get_components(pred.detach(), y, valid_mask=mask)
-                elif active_name == "grad":
-                    grad_loss = loss_fn.grad_only(pred, y, valid_mask=mask)
-                    loss_to_backprop = grad_loss * objective_weight_map["grad"]
-                    with torch.no_grad():
-                        mse_loss = F.mse_loss(pred, y)
-                        dir_loss = loss_fn.direction_only(pred.detach(), y, valid_mask=mask)
-                else:
-                    dir_loss = loss_fn.direction_only(pred, y, valid_mask=mask)
-                    loss_to_backprop = dir_loss * objective_weight_map["direction"]
-                    with torch.no_grad():
-                        mse_loss = F.mse_loss(pred, y)
-                        grad_loss = loss_fn.grad_only(pred.detach(), y, valid_mask=mask)
+                mse_loss = masked_mse_loss(pred, y, fluid_mask)
+                grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=fluid_mask)
+                loss_to_backprop = (
+                    mse_loss * objective_weight_map.get("mse", 0.0)
+                    + grad_loss * objective_weight_map.get("grad", 0.0)
+                    + dir_loss * objective_weight_map.get("direction", 0.0)
+                )
             else:
-                mse_loss = F.mse_loss(pred, y)
-                grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
+                mse_loss = masked_mse_loss(pred, y, fluid_mask)
+                grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=fluid_mask)
 
             if training:
-                if use_multi_objective:
-                    if use_accumulation and step % ACCUM_GRAD != 0:
-                        accum_grad = sanitize_gradient_vector(fast_get_gradient_vector(model))
-                    else:
-                        accum_grad = None
-
-                    optimizer.zero_grad(set_to_none=True)
-                    (loss_to_backprop / ACCUM_GRAD).backward()
-
-                    grad = sanitize_gradient_vector(fast_get_gradient_vector(model))
-                    if grad is None:
-                        continue
-
-                    try:
-                        g_config = operator.calculate_gradient(idx, grad)
-                    except torch._C._LinAlgError:
-                        # Fallback: use the current finite gradient if ConFIG fails numerically.
-                        g_config = grad
-                    except RuntimeError as err:
-                        msg = str(err).lower()
-                        if "cusolver" in msg or "lstsq" in msg or "nan" in msg:
-                            g_config = grad
-                        else:
-                            raise
-
-                    g_config = sanitize_gradient_vector(g_config)
-                    if g_config is None:
-                        continue
-
-                    if accum_grad is not None:
-                        g_config = accum_grad + g_config
-
-                    apply_gradient_fn(model, g_config)
-                    del grad, g_config
-                else:
-                    optimizer.zero_grad(set_to_none=True)
-                    (loss_to_backprop / ACCUM_GRAD).backward()
+                (loss_to_backprop / ACCUM_GRAD).backward()
 
                 if (step + 1) % ACCUM_GRAD == 0 or (step + 1) == len(loader):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -789,10 +753,11 @@ def save_rollout_video(model_to_render, sim_info, mean, std, zero_norm, get_labe
     with torch.inference_mode():
         current = torch.tensor(gt_norm[0], dtype=torch.float32, device=DEVICE).unsqueeze(0)
         labels = get_labels_fn(1)
+        fluid_mask = prepare_fluid_mask(mask_tensor, current)
         for _ in range(rollout_len - 1):
             nxt = safe_model_sample(model_to_render, current, labels)
             nxt = nxt.float()
-            nxt = torch.lerp(zero_norm, nxt, mask_tensor)
+            nxt = apply_obstacle_constraints(nxt, zero_norm, fluid_mask)
             pred_frames.append(nxt[0].cpu().numpy())
             current = nxt
 
@@ -951,20 +916,7 @@ def main():
             "LOSS_WEIGHT_MSE / LOSS_WEIGHT_GRAD / LOSS_WEIGHT_DIRECTION to a non-zero value."
         )
 
-    if len(active_objectives) > 1:
-        from conflictfree.momentum_operator import PseudoMomentumOperator
-        from conflictfree.utils import apply_gradient_vector
-
-        operator = PseudoMomentumOperator(num_vectors=len(active_objectives))
-        apply_gradient_fn = apply_gradient_vector
-        print(f"  Multi-objective mode: ConFIG over {[name for name, _ in active_objectives]}")
-    else:
-        operator = None
-        apply_gradient_fn = None
-        only_name = active_objectives[0][0]
-        print(f"  Single-objective mode: {only_name} (ConFIG skipped)")
-
-    global_step = 0
+    print(f"  Optimizer mode: AdamW weighted combo over {[name for name, _ in active_objectives]}")
 
     train_losses = {"mse": [], "grad": [], "direction": [], "combo": []}
     val_losses = {"mse": [], "grad": [], "direction": [], "combo": []}
@@ -1013,12 +965,8 @@ def main():
                 loss_fn=loss_fn,
                 training=True,
                 optimizer=optimizer,
-                operator=operator,
-                global_step=global_step,
                 active_objectives=active_objectives,
-                apply_gradient_fn=apply_gradient_fn,
             )
-            global_step += len(train_loader)
 
             if val_loader is None:
                 val_loss = {"mse": float("nan"), "grad": float("nan"), "direction": float("nan"), "combo": float("nan")}
