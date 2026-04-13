@@ -10,6 +10,7 @@ across simulations for train/validation splits or for visualization.
 import math
 import os
 import sys
+from contextlib import suppress
 from datetime import datetime
 from multiprocessing import cpu_count, freeze_support
 
@@ -94,15 +95,16 @@ DIRECTION_MASK_SMOOTH_PASSES = 0
 DIRECTION_MASK_SMOOTH_KERNEL = 5
 LOSS_WEIGHT_MSE = 1.0
 LOSS_WEIGHT_GRAD = 2.0
-LOSS_WEIGHT_DIRECTION = 0.00
+LOSS_WEIGHT_DIRECTION = 0.0
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
 DPI_VID = 110
 SKIP_TRAIN = False
-RESUME_CHECKPOINT = "./runs/karman/last.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
+RESUME_CHECKPOINT = None #"./runs/karman/last.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
 MODEL_TYPE = "PDE-S"  # Smallest PDETransformer variant in this repo
-USE_AMP = DEVICE == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+USE_AMP = DEVICE == "cuda" and torch.cuda.is_available()
+AMP_DTYPE = torch.float16
 # This model is attention-heavy and does many explicit permutes/window reshapes,
 # so channels_last is not a reliable speedup here.
 USE_CHANNELS_LAST = False
@@ -113,6 +115,38 @@ CACHE_MASK_FILENAME = "obstacle_mask.float32.npy"
 CACHE_WORKERS = max(1, cpu_count() - 3)
 PREFETCH_FACTOR = 6
 TQDM_UPDATE_EVERY = 20
+
+RUNTIME_AMP_ENABLED = USE_AMP
+RUNTIME_AMP_DTYPE = AMP_DTYPE
+RUNTIME_CUDNN_FALLBACK = False
+
+
+def _is_conv_engine_error(err):
+    msg = str(err).lower()
+    return "unable to find an engine" in msg or "find was unable to find an engine" in msg
+
+
+def safe_model_sample(model, x, labels):
+    global RUNTIME_AMP_ENABLED, RUNTIME_AMP_DTYPE, RUNTIME_CUDNN_FALLBACK
+
+    try:
+        with torch.autocast(device_type="cuda", dtype=RUNTIME_AMP_DTYPE, enabled=RUNTIME_AMP_ENABLED):
+            return model(x, class_labels=labels).sample
+    except RuntimeError as err:
+        if DEVICE != "cuda" or not _is_conv_engine_error(err):
+            raise
+
+        if RUNTIME_AMP_ENABLED:
+            RUNTIME_AMP_ENABLED = False
+            print("[warn] CUDA conv engine failed under AMP fp16; retrying in float32.")
+            return model(x, class_labels=labels).sample
+
+        if not RUNTIME_CUDNN_FALLBACK:
+            RUNTIME_CUDNN_FALLBACK = True
+            print("[warn] CUDA conv engine still failing; enabling CuDNN fallback for forward path.")
+
+        with torch.backends.cudnn.flags(enabled=False, benchmark=False, deterministic=False):
+            return model(x, class_labels=labels).sample
 
 def packed_slice_to_numpy(array):
     return np.array(array, dtype=np.float32, copy=True)
@@ -201,7 +235,7 @@ class MultiSimKarmanDataset(Dataset):
         x = torch.from_numpy(x_np)
         y = torch.from_numpy(y_np)
 
-        return x.float(), y.float(), self._get_mask(sim_idx)
+        return x, y, self._get_mask(sim_idx)
 
 
 class GradMagAndDirectionLoss(nn.Module):
@@ -244,22 +278,35 @@ class GradMagAndDirectionLoss(nn.Module):
         return vm
 
     def get_components(self, pred, target, valid_mask=None, spacing=None):
+        pred_g, target_g, m = self._stacked_grads_and_mask(pred, target, valid_mask, spacing)
+        grad_loss = self._grad_mag_loss(pred_g, target_g, m)
+        dir_loss = self._direction_loss_from_grads(pred_g, target_g, m, pred.dtype)
+
+        return grad_loss, dir_loss
+
+    def grad_only(self, pred, target, valid_mask=None, spacing=None):
+        pred_g, target_g, m = self._stacked_grads_and_mask(pred, target, valid_mask, spacing)
+        return self._grad_mag_loss(pred_g, target_g, m)
+
+    def direction_only(self, pred, target, valid_mask=None, spacing=None):
+        pred_g, target_g, m = self._stacked_grads_and_mask(pred, target, valid_mask, spacing)
+        return self._direction_loss_from_grads(pred_g, target_g, m, pred.dtype)
+
+    def _stacked_grads_and_mask(self, pred, target, valid_mask=None, spacing=None):
         pred_grads = self._spatial_grads(pred, spacing=spacing)
         target_grads = self._spatial_grads(target, spacing=spacing)
-
         pred_g = torch.stack(pred_grads, dim=2)
         target_g = torch.stack(target_grads, dim=2)
-
         m = self._prepare_mask(valid_mask, pred)
+        return pred_g, target_g, m
 
-        # Gradient Magnitude / Sobolev term
+    def _grad_mag_loss(self, pred_g, target_g, mask):
         grad_diff_sq = (pred_g - target_g).square().sum(dim=2)
-        if m is not None:
-            grad_loss = (grad_diff_sq * m).sum() / (m.sum() + self.eps)
-        else:
-            grad_loss = grad_diff_sq.mean()
+        if mask is not None:
+            return (grad_diff_sq * mask).sum() / (mask.sum() + self.eps)
+        return grad_diff_sq.mean()
 
-        # Gradient Direction term
+    def _direction_loss_from_grads(self, pred_g, target_g, mask, dtype):
         dot = (pred_g * target_g).sum(dim=2)
         pred_norm = torch.sqrt(pred_g.square().sum(dim=2) + self.eps)
         target_norm = torch.sqrt(target_g.square().sum(dim=2) + self.eps)
@@ -270,23 +317,12 @@ class GradMagAndDirectionLoss(nn.Module):
         if self.use_smooth_dir_weight:
             w_dir = target_norm / (target_norm + self.dir_tau)
         else:
-            w_dir = (target_norm > self.dir_tau).to(dtype=pred.dtype)
+            w_dir = (target_norm > self.dir_tau).to(dtype=dtype)
 
-        if m is not None:
-            w = w_dir * m
-            dir_loss = (dir_loss_pointwise * w).sum() / (w.sum() + self.eps)
-        else:
-            dir_loss = (dir_loss_pointwise * w_dir).sum() / (w_dir.sum() + self.eps)
-
-        return grad_loss, dir_loss
-
-    def grad_only(self, pred, target, valid_mask=None, spacing=None):
-        grad_loss, _ = self.get_components(pred, target, valid_mask, spacing)
-        return grad_loss
-
-    def direction_only(self, pred, target, valid_mask=None, spacing=None):
-        _, dir_loss = self.get_components(pred, target, valid_mask, spacing)
-        return dir_loss
+        if mask is not None:
+            w = w_dir * mask
+            return (dir_loss_pointwise * w).sum() / (w.sum() + self.eps)
+        return (dir_loss_pointwise * w_dir).sum() / (w_dir.sum() + self.eps)
 
     def _spatial_grads(self, x: torch.Tensor, spacing=None):
         if x.ndim == 4:
@@ -438,28 +474,17 @@ def get_model():
 
 
 def create_optimizer(model):
-    # PseudoMomentumOperator already applies momentum/variance-style scaling.
-    # Use SGD here to avoid double-adaptation from Adam-like optimizers.
-    return torch.optim.SGD(
-        model.parameters(),
-        lr=LR,
-        momentum=0.9,
-        weight_decay=1e-6,
-        nesterov=True,
-    )
-
-
-def build_objective_schedule():
-    schedule = []
-    if LOSS_WEIGHT_MSE > 0:
-        schedule.append(("mse", LOSS_WEIGHT_MSE))
-    if LOSS_WEIGHT_GRAD > 0:
-        schedule.append(("grad", LOSS_WEIGHT_GRAD))
-    if LOSS_WEIGHT_DIRECTION > 0:
-        schedule.append(("direction", LOSS_WEIGHT_DIRECTION))
-    if not schedule:
-        raise RuntimeError("At least one loss weight must be > 0.")
-    return schedule
+    adamw_kwargs = {
+        "lr": LR,
+        "weight_decay": 1e-6,
+        "foreach": torch.cuda.is_available(),
+    }
+    if torch.cuda.is_available():
+        with suppress(TypeError, RuntimeError):
+            adamw_kwargs["fused"] = True
+            return torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+        adamw_kwargs.pop("fused", None)
+    return torch.optim.AdamW(model.parameters(), **adamw_kwargs)
 
 
 def move_batch_to_device(x, y, mask):
@@ -583,15 +608,50 @@ def sanitize_gradient_vector(grad_vec):
     return torch.nan_to_num(grad_vec, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimizer=None, operator=None, global_step=0, objective_schedule=None):
+def get_active_objectives():
+    objectives = [
+        ("mse", float(LOSS_WEIGHT_MSE)),
+        ("grad", float(LOSS_WEIGHT_GRAD)),
+        ("direction", float(LOSS_WEIGHT_DIRECTION)),
+    ]
+    return [(name, weight) for name, weight in objectives if weight != 0.0]
+
+
+def run_epoch(
+    model,
+    loader,
+    zero_norm,
+    get_labels_fn,
+    loss_fn,
+    training,
+    optimizer=None,
+    operator=None,
+    global_step=0,
+    active_objectives=None,
+    apply_gradient_fn=None,
+):
+    if active_objectives is None:
+        active_objectives = get_active_objectives()
+
+    if training and not active_objectives:
+        raise ValueError("All loss weights are zero; at least one training objective must be active.")
+
+    objective_names = [name for name, _ in active_objectives] if active_objectives else ["mse", "grad", "direction"]
+    objective_weight_map = {name: weight for name, weight in active_objectives}
+
     if training:
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        from conflictfree.utils import apply_gradient_vector
+        use_multi_objective = operator is not None and len(active_objectives) > 1
+        if use_multi_objective and apply_gradient_fn is None:
+            raise ValueError("apply_gradient_fn is required when multi-objective mode is active.")
         desc = "tr"
     else:
         model.eval()
+        use_multi_objective = False
         desc = "va"
+
+    use_accumulation = ACCUM_GRAD > 1
 
     loss_accum = {
         "mse": torch.zeros((), device=DEVICE),
@@ -608,72 +668,73 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimi
             x, y, mask = move_batch_to_device(x, y, mask)
             labels = get_labels_fn(x.shape[0])
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
-                pred = model(x, class_labels=labels).sample
+            pred = safe_model_sample(model, x, labels)
             pred = pred.float()
             pred = torch.lerp(zero_norm, pred, mask)
 
             if training:
-                idx = (global_step + step) % len(objective_schedule)
-                objective_name, objective_weight = objective_schedule[idx]
+                idx = (global_step + step) % len(objective_names)
+                active_name = objective_names[idx]
 
-                if objective_name == "mse":
+                if active_name == "mse":
                     mse_loss = F.mse_loss(pred, y)
-                    loss_to_backprop = mse_loss * objective_weight
+                    loss_to_backprop = mse_loss * objective_weight_map["mse"]
                     with torch.no_grad():
                         grad_loss, dir_loss = loss_fn.get_components(pred.detach(), y, valid_mask=mask)
-                elif objective_name == "grad":
-                    grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
-                    loss_to_backprop = grad_loss * objective_weight
+                elif active_name == "grad":
+                    grad_loss = loss_fn.grad_only(pred, y, valid_mask=mask)
+                    loss_to_backprop = grad_loss * objective_weight_map["grad"]
                     with torch.no_grad():
                         mse_loss = F.mse_loss(pred, y)
-                    dir_loss = dir_loss.detach()
+                        dir_loss = loss_fn.direction_only(pred.detach(), y, valid_mask=mask)
                 else:
-                    grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
-                    loss_to_backprop = dir_loss * objective_weight
+                    dir_loss = loss_fn.direction_only(pred, y, valid_mask=mask)
+                    loss_to_backprop = dir_loss * objective_weight_map["direction"]
                     with torch.no_grad():
                         mse_loss = F.mse_loss(pred, y)
-                    grad_loss = grad_loss.detach()
+                        grad_loss = loss_fn.grad_only(pred.detach(), y, valid_mask=mask)
             else:
                 mse_loss = F.mse_loss(pred, y)
                 grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
 
             if training:
-                if step % ACCUM_GRAD != 0:
-                    accum_grad = sanitize_gradient_vector(fast_get_gradient_vector(model))
-                else:
-                    accum_grad = None
-
-                optimizer.zero_grad(set_to_none=True)
-                
-                (loss_to_backprop / ACCUM_GRAD).backward()
-                
-                grad = sanitize_gradient_vector(fast_get_gradient_vector(model))
-                if grad is None:
-                    continue
-
-                try:
-                    g_config = operator.calculate_gradient(idx, grad)
-                except torch._C._LinAlgError:
-                    # Fallback: use the current finite gradient if ConFIG fails numerically.
-                    g_config = grad
-                except RuntimeError as err:
-                    msg = str(err).lower()
-                    if "cusolver" in msg or "lstsq" in msg or "nan" in msg:
-                        g_config = grad
+                if use_multi_objective:
+                    if use_accumulation and step % ACCUM_GRAD != 0:
+                        accum_grad = sanitize_gradient_vector(fast_get_gradient_vector(model))
                     else:
-                        raise
+                        accum_grad = None
 
-                g_config = sanitize_gradient_vector(g_config)
-                if g_config is None:
-                    continue
-                
-                if accum_grad is not None:
-                    g_config = accum_grad + g_config
-                    
-                apply_gradient_vector(model, g_config)
-                
-                del grad, g_config
+                    optimizer.zero_grad(set_to_none=True)
+                    (loss_to_backprop / ACCUM_GRAD).backward()
+
+                    grad = sanitize_gradient_vector(fast_get_gradient_vector(model))
+                    if grad is None:
+                        continue
+
+                    try:
+                        g_config = operator.calculate_gradient(idx, grad)
+                    except torch._C._LinAlgError:
+                        # Fallback: use the current finite gradient if ConFIG fails numerically.
+                        g_config = grad
+                    except RuntimeError as err:
+                        msg = str(err).lower()
+                        if "cusolver" in msg or "lstsq" in msg or "nan" in msg:
+                            g_config = grad
+                        else:
+                            raise
+
+                    g_config = sanitize_gradient_vector(g_config)
+                    if g_config is None:
+                        continue
+
+                    if accum_grad is not None:
+                        g_config = accum_grad + g_config
+
+                    apply_gradient_fn(model, g_config)
+                    del grad, g_config
+                else:
+                    optimizer.zero_grad(set_to_none=True)
+                    (loss_to_backprop / ACCUM_GRAD).backward()
 
                 if (step + 1) % ACCUM_GRAD == 0 or (step + 1) == len(loader):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -729,8 +790,7 @@ def save_rollout_video(model_to_render, sim_info, mean, std, zero_norm, get_labe
         current = torch.tensor(gt_norm[0], dtype=torch.float32, device=DEVICE).unsqueeze(0)
         labels = get_labels_fn(1)
         for _ in range(rollout_len - 1):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
-                nxt = model_to_render(current, class_labels=labels).sample
+            nxt = safe_model_sample(model_to_render, current, labels)
             nxt = nxt.float()
             nxt = torch.lerp(zero_norm, nxt, mask_tensor)
             pred_frames.append(nxt[0].cpu().numpy())
@@ -857,6 +917,7 @@ def main():
     model = get_model()
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"  Parameters: {n_params:.1f} M")
+    print(f"  AMP: {'enabled (fp16)' if USE_AMP else 'disabled'}")
     if USE_CHANNELS_LAST:
         print("  Memory format: channels_last")
     if DEVICE == "cuda":
@@ -864,7 +925,6 @@ def main():
 
     optimizer = create_optimizer(model)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.25)
-    objective_schedule = build_objective_schedule()
 
     # Build loss function
     loss_fn = GradMagAndDirectionLoss(
@@ -878,18 +938,32 @@ def main():
         "  Combo weights: "
         f"mse={LOSS_WEIGHT_MSE:g}, grad={LOSS_WEIGHT_GRAD:g}, dir={LOSS_WEIGHT_DIRECTION:g}"
     )
-    print(
-        "  Active objectives for ConFIG: "
-        + ", ".join(name for name, _ in objective_schedule)
-    )
 
     task_label = torch.tensor([1000], dtype=torch.long, device=DEVICE)
 
     def get_labels(batch_size):
         return task_label.expand(batch_size)
 
-    from conflictfree.momentum_operator import PseudoMomentumOperator
-    operator = PseudoMomentumOperator(num_vectors=len(objective_schedule))
+    active_objectives = get_active_objectives()
+    if not active_objectives:
+        raise ValueError(
+            "All loss weights are zero. Set at least one of "
+            "LOSS_WEIGHT_MSE / LOSS_WEIGHT_GRAD / LOSS_WEIGHT_DIRECTION to a non-zero value."
+        )
+
+    if len(active_objectives) > 1:
+        from conflictfree.momentum_operator import PseudoMomentumOperator
+        from conflictfree.utils import apply_gradient_vector
+
+        operator = PseudoMomentumOperator(num_vectors=len(active_objectives))
+        apply_gradient_fn = apply_gradient_vector
+        print(f"  Multi-objective mode: ConFIG over {[name for name, _ in active_objectives]}")
+    else:
+        operator = None
+        apply_gradient_fn = None
+        only_name = active_objectives[0][0]
+        print(f"  Single-objective mode: {only_name} (ConFIG skipped)")
+
     global_step = 0
 
     train_losses = {"mse": [], "grad": [], "direction": [], "combo": []}
@@ -941,7 +1015,8 @@ def main():
                 optimizer=optimizer,
                 operator=operator,
                 global_step=global_step,
-                objective_schedule=objective_schedule,
+                active_objectives=active_objectives,
+                apply_gradient_fn=apply_gradient_fn,
             )
             global_step += len(train_loader)
 
@@ -955,6 +1030,7 @@ def main():
                     get_labels_fn=get_labels,
                     loss_fn=loss_fn,
                     training=False,
+                    active_objectives=active_objectives,
                 )
 
             scheduler.step()
