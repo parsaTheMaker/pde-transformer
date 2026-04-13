@@ -10,7 +10,6 @@ across simulations for train/validation splits or for visualization.
 import math
 import os
 import sys
-from contextlib import suppress
 from datetime import datetime
 from multiprocessing import cpu_count, freeze_support
 
@@ -84,24 +83,24 @@ np.random.seed(42)
 SIM_ROOT = "/home/vatani/data_vortex/256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
 OUT_DIR = os.path.join("runs", "karman")
 EPOCHS = 40
-BATCH_SIZE = 24
+BATCH_SIZE = 12
 ACCUM_GRAD = 1
 LR = 4e-5
 VAL_FRAC = 0.10
-WARMUP_FRAC = 0.5
+WARMUP_FRAC = 0.3
 # Loss configuration
 DIRECTION_LOSS_EPS = 1e-8
 DIRECTION_MASK_SMOOTH_PASSES = 0
 DIRECTION_MASK_SMOOTH_KERNEL = 5
 LOSS_WEIGHT_MSE = 1.0
-LOSS_WEIGHT_GRAD = 0.0
+LOSS_WEIGHT_GRAD = 2.0
 LOSS_WEIGHT_DIRECTION = 0.00
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
 DPI_VID = 110
 SKIP_TRAIN = False
-RESUME_CHECKPOINT = "./runs/karman/last_mse_only.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
+RESUME_CHECKPOINT = "./runs/karman/last.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
 MODEL_TYPE = "PDE-S"  # Smallest PDETransformer variant in this repo
 USE_AMP = DEVICE == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 # This model is attention-heavy and does many explicit permutes/window reshapes,
@@ -439,17 +438,28 @@ def get_model():
 
 
 def create_optimizer(model):
-    adamw_kwargs = {
-        "lr": LR,
-        "weight_decay": 1e-6,
-        "foreach": torch.cuda.is_available(),
-    }
-    if torch.cuda.is_available():
-        with suppress(TypeError, RuntimeError):
-            adamw_kwargs["fused"] = True
-            return torch.optim.AdamW(model.parameters(), **adamw_kwargs)
-        adamw_kwargs.pop("fused", None)
-    return torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+    # PseudoMomentumOperator already applies momentum/variance-style scaling.
+    # Use SGD here to avoid double-adaptation from Adam-like optimizers.
+    return torch.optim.SGD(
+        model.parameters(),
+        lr=LR,
+        momentum=0.9,
+        weight_decay=1e-6,
+        nesterov=True,
+    )
+
+
+def build_objective_schedule():
+    schedule = []
+    if LOSS_WEIGHT_MSE > 0:
+        schedule.append(("mse", LOSS_WEIGHT_MSE))
+    if LOSS_WEIGHT_GRAD > 0:
+        schedule.append(("grad", LOSS_WEIGHT_GRAD))
+    if LOSS_WEIGHT_DIRECTION > 0:
+        schedule.append(("direction", LOSS_WEIGHT_DIRECTION))
+    if not schedule:
+        raise RuntimeError("At least one loss weight must be > 0.")
+    return schedule
 
 
 def move_batch_to_device(x, y, mask):
@@ -573,7 +583,7 @@ def sanitize_gradient_vector(grad_vec):
     return torch.nan_to_num(grad_vec, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimizer=None, operator=None, global_step=0):
+def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimizer=None, operator=None, global_step=0, objective_schedule=None):
     if training:
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -604,21 +614,23 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimi
             pred = torch.lerp(zero_norm, pred, mask)
 
             if training:
-                idx = (global_step + step) % 3
-                if idx == 0:
+                idx = (global_step + step) % len(objective_schedule)
+                objective_name, objective_weight = objective_schedule[idx]
+
+                if objective_name == "mse":
                     mse_loss = F.mse_loss(pred, y)
-                    loss_to_backprop = mse_loss * LOSS_WEIGHT_MSE
+                    loss_to_backprop = mse_loss * objective_weight
                     with torch.no_grad():
                         grad_loss, dir_loss = loss_fn.get_components(pred.detach(), y, valid_mask=mask)
-                elif idx == 1:
+                elif objective_name == "grad":
                     grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
-                    loss_to_backprop = grad_loss * LOSS_WEIGHT_GRAD
+                    loss_to_backprop = grad_loss * objective_weight
                     with torch.no_grad():
                         mse_loss = F.mse_loss(pred, y)
                     dir_loss = dir_loss.detach()
                 else:
                     grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
-                    loss_to_backprop = dir_loss * LOSS_WEIGHT_DIRECTION
+                    loss_to_backprop = dir_loss * objective_weight
                     with torch.no_grad():
                         mse_loss = F.mse_loss(pred, y)
                     grad_loss = grad_loss.detach()
@@ -852,6 +864,7 @@ def main():
 
     optimizer = create_optimizer(model)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.25)
+    objective_schedule = build_objective_schedule()
 
     # Build loss function
     loss_fn = GradMagAndDirectionLoss(
@@ -865,6 +878,10 @@ def main():
         "  Combo weights: "
         f"mse={LOSS_WEIGHT_MSE:g}, grad={LOSS_WEIGHT_GRAD:g}, dir={LOSS_WEIGHT_DIRECTION:g}"
     )
+    print(
+        "  Active objectives for ConFIG: "
+        + ", ".join(name for name, _ in objective_schedule)
+    )
 
     task_label = torch.tensor([1000], dtype=torch.long, device=DEVICE)
 
@@ -872,7 +889,7 @@ def main():
         return task_label.expand(batch_size)
 
     from conflictfree.momentum_operator import PseudoMomentumOperator
-    operator = PseudoMomentumOperator(num_vectors=3)
+    operator = PseudoMomentumOperator(num_vectors=len(objective_schedule))
     global_step = 0
 
     train_losses = {"mse": [], "grad": [], "direction": [], "combo": []}
@@ -924,6 +941,7 @@ def main():
                 optimizer=optimizer,
                 operator=operator,
                 global_step=global_step,
+                objective_schedule=objective_schedule,
             )
             global_step += len(train_loader)
 
