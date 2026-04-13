@@ -83,7 +83,7 @@ DIRECTION_MASK_SMOOTH_PASSES = 0
 DIRECTION_MASK_SMOOTH_KERNEL = 5
 LOSS_WEIGHT_MSE = 1.0
 LOSS_WEIGHT_GRAD = 0.0
-LOSS_WEIGHT_DIRECTION = 0.02
+LOSS_WEIGHT_DIRECTION = 0.001
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
@@ -482,19 +482,12 @@ def move_batch_to_device(x, y, mask):
     return x, y, mask
 
 
-def update_progress(progress_bar, loss_dict, sample_count):
-    denom = max(1, sample_count)
-    avg_loss_dict = {}
-    for key, value in loss_dict.items():
-        avg = value / denom
-        if isinstance(avg, torch.Tensor):
-            avg = avg.detach().item()
-        avg_loss_dict[key] = avg
+def update_progress(progress_bar, latest_loss):
     progress_bar.set_postfix(
-        mse=f"{avg_loss_dict['mse']:.6f}",
-        grad=f"{avg_loss_dict['grad']:.6f}",
-        dir=f"{avg_loss_dict['direction']:.6f}",
-        combo=f"{avg_loss_dict['combo']:.6f}"
+        mse=f"{latest_loss.get('mse', 0.0):.6f}",
+        grad=f"{latest_loss.get('grad', 0.0):.6f}",
+        dir=f"{latest_loss.get('direction', 0.0):.6f}",
+        combo=f"{latest_loss.get('combo', 0.0):.6f}"
     )
 
 
@@ -592,6 +585,9 @@ def prepare_fluid_mask(mask, ref_tensor):
         fluid_mask = fluid_mask.unsqueeze(1)
     if fluid_mask.ndim != ref_tensor.ndim:
         raise ValueError(f"Mask ndim {fluid_mask.ndim} incompatible with tensor ndim {ref_tensor.ndim}.")
+    if fluid_mask.shape[0] != ref_tensor.shape[0] or fluid_mask.shape[2:] != ref_tensor.shape[2:]:
+        raise ValueError(f"Mask shape {fluid_mask.shape} incompatible with tensor shape {ref_tensor.shape}.")
+    return fluid_mask.clamp(0.0, 1.0)
     if fluid_mask.shape[0] != ref_tensor.shape[0] or fluid_mask.shape[2:] != ref_tensor.shape[2:]:
         raise ValueError(f"Mask shape {fluid_mask.shape} incompatible with tensor shape {ref_tensor.shape}.")
     return fluid_mask.clamp(0.0, 1.0)
@@ -717,7 +713,13 @@ def run_epoch(
             
             sample_count += batch_size
             if step == 0 or (step + 1) % TQDM_UPDATE_EVERY == 0 or (step + 1) == len(loader):
-                update_progress(progress_bar, loss_accum, sample_count)
+                latest_loss = {
+                    "mse": mse_loss.detach().item(),
+                    "grad": grad_loss.detach().item(),
+                    "direction": dir_loss.detach().item(),
+                    "combo": combo_val.item()
+                }
+                update_progress(progress_bar, latest_loss)
 
     return {
         "mse": (loss_accum["mse"] / max(1, sample_count)).detach().item(),
