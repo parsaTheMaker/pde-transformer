@@ -286,16 +286,19 @@ class GradMagAndDirectionLoss(nn.Module):
 
     def _direction_loss_from_grads(self, pred_g, target_g, mask, dtype):
         dot = (pred_g * target_g).sum(dim=2)
+        
+        target_norm_raw = torch.sqrt(target_g.square().sum(dim=2))
+        
         pred_norm = torch.sqrt(pred_g.square().sum(dim=2) + self.eps)
         target_norm = torch.sqrt(target_g.square().sum(dim=2) + self.eps)
 
-        cos = dot / (pred_norm * target_norm + self.eps)
+        cos = dot / (pred_norm * target_norm)
         dir_loss_pointwise = 1.0 - cos
 
         if self.use_smooth_dir_weight:
-            w_dir = target_norm / (target_norm + self.dir_tau)
+            w_dir = target_norm_raw / (target_norm_raw + self.dir_tau)
         else:
-            w_dir = (target_norm > self.dir_tau).to(dtype=dtype)
+            w_dir = (target_norm_raw > self.dir_tau).to(dtype=dtype)
 
         if mask is not None:
             w = w_dir * mask
@@ -584,7 +587,7 @@ def get_active_objectives():
 def prepare_fluid_mask(mask, ref_tensor):
     if mask is None:
         return None
-    fluid_mask = mask.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+    fluid_mask = (1.0 - mask).to(device=ref_tensor.device, dtype=ref_tensor.dtype)
     if fluid_mask.ndim == ref_tensor.ndim - 1:
         fluid_mask = fluid_mask.unsqueeze(1)
     if fluid_mask.ndim != ref_tensor.ndim:
@@ -1015,9 +1018,9 @@ def main():
             epoch_log_note = "best" if best_marker else ""
             if loss_log_path:
                 log_line = (
-                    f"{datetime.now().isoformat()} epoch={epoch} lr={current_lr:.2e} "
-                    f"train_mse={train_loss['mse']:.6f} train_grad={train_loss['grad']:.6f} train_dir={train_loss['direction']:.6f} train_combo={train_loss['combo']:.6f} "
-                    f"val_mse={val_loss['mse']:.6f} val_grad={val_loss['grad']:.6f} val_dir={val_loss['direction']:.6f} val_combo={val_loss['combo']:.6f} {epoch_log_note}\n"
+                    f"{datetime.now().isoformat()} {epoch} {current_lr:.2e} "
+                    f"{train_loss['mse']:.6f} {train_loss['grad']:.6f} {train_loss['direction']:.6f} {train_loss['combo']:.6f} "
+                    f"{val_loss['mse']:.6f} {val_loss['grad']:.6f} {val_loss['direction']:.6f} {val_loss['combo']:.6f} {epoch_log_note}\n"
                 )
                 with open(loss_log_path, "a", encoding="utf-8") as log_file:
                     log_file.write(log_line)
