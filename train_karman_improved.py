@@ -42,18 +42,6 @@ torch.backends.cudnn.enabled = True
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
-    try:
-        torch.backends.cuda.matmul.allow_tf32 = True
-    except AttributeError:
-        pass
-    try:
-        torch.backends.cudnn.allow_tf32 = True
-    except AttributeError:
-        pass
-    try:
-        torch.set_float32_matmul_precision("high")
-    except AttributeError:
-        pass
 
 torch.cuda.empty_cache()
 
@@ -84,9 +72,9 @@ np.random.seed(42)
 SIM_ROOT = "./256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
 OUT_DIR = os.path.join("runs", "karman")
 EPOCHS = 40
-BATCH_SIZE = 32
+BATCH_SIZE = 24
 ACCUM_GRAD = 1
-LR = 4e-5
+LR = 1e-5
 VAL_FRAC = 0.10
 WARMUP_FRAC = 0.3
 # Loss configuration
@@ -103,8 +91,6 @@ DPI_VID = 110
 SKIP_TRAIN = False
 RESUME_CHECKPOINT = None #"./runs/karman/last.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
 MODEL_TYPE = "PDE-S"  # Smallest PDETransformer variant in this repo
-USE_AMP = DEVICE == "cuda" and torch.cuda.is_available()
-AMP_DTYPE = torch.float16
 # This model is attention-heavy and does many explicit permutes/window reshapes,
 # so channels_last is not a reliable speedup here.
 USE_CHANNELS_LAST = False
@@ -116,8 +102,6 @@ CACHE_WORKERS = max(1, cpu_count() - 3)
 PREFETCH_FACTOR = 6
 TQDM_UPDATE_EVERY = 20
 
-RUNTIME_AMP_ENABLED = USE_AMP
-RUNTIME_AMP_DTYPE = AMP_DTYPE
 RUNTIME_CUDNN_FALLBACK = False
 
 
@@ -127,19 +111,13 @@ def _is_conv_engine_error(err):
 
 
 def safe_model_sample(model, x, labels):
-    global RUNTIME_AMP_ENABLED, RUNTIME_AMP_DTYPE, RUNTIME_CUDNN_FALLBACK
+    global RUNTIME_CUDNN_FALLBACK
 
     try:
-        with torch.autocast(device_type="cuda", dtype=RUNTIME_AMP_DTYPE, enabled=RUNTIME_AMP_ENABLED):
-            return model(x, class_labels=labels).sample
+        return model(x, class_labels=labels).sample
     except RuntimeError as err:
         if DEVICE != "cuda" or not _is_conv_engine_error(err):
             raise
-
-        if RUNTIME_AMP_ENABLED:
-            RUNTIME_AMP_ENABLED = False
-            print("[warn] CUDA conv engine failed under AMP fp16; retrying in float32.")
-            return model(x, class_labels=labels).sample
 
         if not RUNTIME_CUDNN_FALLBACK:
             RUNTIME_CUDNN_FALLBACK = True
@@ -488,14 +466,16 @@ def create_optimizer(model):
 
 
 def move_batch_to_device(x, y, mask):
-    if DEVICE != "cuda":
+    if x.device.type != DEVICE:
         x = x.to(DEVICE, non_blocking=PIN_MEMORY)
+    if y.device.type != DEVICE:
         y = y.to(DEVICE, non_blocking=PIN_MEMORY)
+    if mask.device.type != DEVICE:
         mask = mask.to(DEVICE, non_blocking=PIN_MEMORY)
-        if USE_CHANNELS_LAST:
-            x = x.contiguous(memory_format=torch.channels_last)
-            y = y.contiguous(memory_format=torch.channels_last)
-            mask = mask.contiguous(memory_format=torch.channels_last)
+    if USE_CHANNELS_LAST:
+        x = x.contiguous(memory_format=torch.channels_last)
+        y = y.contiguous(memory_format=torch.channels_last)
+        mask = mask.contiguous(memory_format=torch.channels_last)
     return x, y, mask
 
 
@@ -659,7 +639,9 @@ def run_epoch(
         model.eval()
         desc = "va"
 
-    use_accumulation = ACCUM_GRAD > 1
+    combo_weight_mse = float(objective_weight_map.get("mse", 0.0))
+    combo_weight_grad = float(objective_weight_map.get("grad", 0.0))
+    combo_weight_direction = float(objective_weight_map.get("direction", 0.0))
 
     loss_accum = {
         "mse": torch.zeros((), device=DEVICE),
@@ -668,6 +650,7 @@ def run_epoch(
         "combo": torch.zeros((), device=DEVICE),
     }
     sample_count = 0
+    accum_steps = 0
 
     context = torch.enable_grad if training else torch.inference_mode
     with context():
@@ -689,21 +672,32 @@ def run_epoch(
                 mse_loss = masked_mse_loss(pred, y, fluid_mask)
                 grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=fluid_mask)
                 loss_to_backprop = (
-                    mse_loss * objective_weight_map.get("mse", 0.0)
-                    + grad_loss * objective_weight_map.get("grad", 0.0)
-                    + dir_loss * objective_weight_map.get("direction", 0.0)
+                    mse_loss * combo_weight_mse
+                    + grad_loss * combo_weight_grad
+                    + dir_loss * combo_weight_direction
                 )
+                if not torch.isfinite(loss_to_backprop):
+                    raise RuntimeError("Non-finite training loss encountered.")
             else:
                 mse_loss = masked_mse_loss(pred, y, fluid_mask)
                 grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=fluid_mask)
 
             if training:
                 (loss_to_backprop / ACCUM_GRAD).backward()
+                accum_steps += 1
 
                 if (step + 1) % ACCUM_GRAD == 0 or (step + 1) == len(loader):
+                    if accum_steps < ACCUM_GRAD:
+                        # Correct the final partial accumulation window so its effective gradient
+                        # magnitude matches full windows.
+                        scale = ACCUM_GRAD / max(1, accum_steps)
+                        for param in model.parameters():
+                            if param.grad is not None:
+                                param.grad.mul_(scale)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    accum_steps = 0
 
             batch_size = x.shape[0]
             loss_accum["mse"] += mse_loss.detach() * batch_size
@@ -712,9 +706,9 @@ def run_epoch(
             
             # combo tracking
             combo_val = (
-                mse_loss.detach() * LOSS_WEIGHT_MSE
-                + grad_loss.detach() * LOSS_WEIGHT_GRAD
-                + dir_loss.detach() * LOSS_WEIGHT_DIRECTION
+                mse_loss.detach() * combo_weight_mse
+                + grad_loss.detach() * combo_weight_grad
+                + dir_loss.detach() * combo_weight_direction
             )
             loss_accum["combo"] += combo_val * batch_size
             
@@ -869,6 +863,11 @@ def main():
     print(f"  per-channel std:  {std.numpy().round(5)}")
 
     train_ds = MultiSimKarmanDataset(train_sim_infos, mean, std)
+    if len(train_ds) == 0:
+        raise RuntimeError(
+            "Training dataset is empty after warmup trimming. "
+            "Lower WARMUP_FRAC or verify frame counts in simulation caches."
+        )
     val_ds = MultiSimKarmanDataset(val_sim_infos, mean, std) if val_sim_infos else None
     train_loader = maybe_wrap_prefetch(build_loader(train_ds, shuffle=True))
     val_loader = maybe_wrap_prefetch(build_loader(val_ds, shuffle=False)) if val_ds is not None else None
@@ -882,7 +881,6 @@ def main():
     model = get_model()
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"  Parameters: {n_params:.1f} M")
-    print(f"  AMP: {'enabled (fp16)' if USE_AMP else 'disabled'}")
     if USE_CHANNELS_LAST:
         print("  Memory format: channels_last")
     if DEVICE == "cuda":
@@ -992,8 +990,12 @@ def main():
             val_losses["direction"].append(val_loss["direction"])
             val_losses["combo"].append(val_loss["combo"])
 
-            if val_loss["combo"] < best_val:
-                best_val = val_loss["combo"]
+            monitored_combo = val_loss["combo"]
+            if not math.isfinite(monitored_combo):
+                monitored_combo = train_loss["combo"]
+
+            if monitored_combo < best_val:
+                best_val = monitored_combo
                 best_marker = " ← best combo"
             else:
                 best_marker = ""
