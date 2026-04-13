@@ -385,6 +385,8 @@ def build_loader(dataset, shuffle):
     if NUM_WORKERS > 0:
         kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = PREFETCH_FACTOR
+    if PIN_MEMORY:
+        kwargs["pin_memory_device"] = DEVICE
     return DataLoader(dataset, **kwargs)
 
 
