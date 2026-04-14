@@ -72,7 +72,7 @@ np.random.seed(42)
 SIM_ROOT = "./256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
 OUT_DIR = os.path.join("runs", "karman")
 EPOCHS = 40
-BATCH_SIZE = 48
+BATCH_SIZE = 32
 ACCUM_GRAD = 1
 LR = 1e-5
 VAL_FRAC = 0.10
@@ -95,12 +95,11 @@ USE_AMP = DEVICE == "cuda" and torch.cuda.is_available()
 # This model is attention-heavy and does many explicit permutes/window reshapes,
 # so channels_last is not a reliable speedup here.
 USE_CHANNELS_LAST = False
-NUM_WORKERS = max(0, cpu_count() - 3)
+NUM_WORKERS = 2
 PIN_MEMORY = DEVICE == "cuda"
 CACHE_STATES_FILENAME = "states.float32.npy"
 CACHE_MASK_FILENAME = "obstacle_mask.float32.npy"
-CACHE_WORKERS = max(1, cpu_count() - 3)
-PREFETCH_FACTOR = 6
+CACHE_WORKERS = 2
 TQDM_UPDATE_EVERY = 20
 
 RUNTIME_CUDNN_FALLBACK = False
@@ -200,7 +199,7 @@ class MultiSimKarmanDataset(Dataset):
             mask_np = packed_slice_to_numpy(load_packed_array(self.sims[sim_idx]["packed_mask_path"]))
             mask_t = torch.from_numpy(mask_np).float().clamp_(0.0, 1.0)
             self._mask_tensors[sim_idx] = mask_t
-        return mask_t
+        return mask_t.clone()
 
     def __getitem__(self, idx):
         sim_idx, frame_idx = self.samples[idx]
@@ -366,59 +365,9 @@ def build_loader(dataset, shuffle):
     }
     if NUM_WORKERS > 0:
         kwargs["persistent_workers"] = True
-        kwargs["prefetch_factor"] = PREFETCH_FACTOR
     if PIN_MEMORY:
         kwargs["pin_memory_device"] = DEVICE
     return DataLoader(dataset, **kwargs)
-
-
-class DevicePrefetchLoader:
-    def __init__(self, loader, device, use_channels_last):
-        self.loader = loader
-        self.device = device
-        self.use_channels_last = use_channels_last
-        self.enabled = device == "cuda" and torch.cuda.is_available()
-        self.stream = torch.cuda.Stream(device=device) if self.enabled else None
-
-    def __len__(self):
-        return len(self.loader)
-
-    def _move_batch(self, batch):
-        x, y, mask = batch
-        x = x.to(self.device, non_blocking=True)
-        y = y.to(self.device, non_blocking=True)
-        mask = mask.to(self.device, non_blocking=True)
-        if self.use_channels_last:
-            x = x.contiguous(memory_format=torch.channels_last)
-            y = y.contiguous(memory_format=torch.channels_last)
-            mask = mask.contiguous(memory_format=torch.channels_last)
-        return x, y, mask
-
-    def __iter__(self):
-        if not self.enabled:
-            for batch in self.loader:
-                yield batch
-            return
-
-        loader_iter = iter(self.loader)
-        next_batch = None
-
-        def preload():
-            nonlocal next_batch
-            try:
-                batch = next(loader_iter)
-            except StopIteration:
-                next_batch = None
-                return
-            with torch.cuda.stream(self.stream):
-                next_batch = self._move_batch(batch)
-
-        preload()
-        while next_batch is not None:
-            torch.cuda.current_stream(self.device).wait_stream(self.stream)
-            batch = next_batch
-            preload()
-            yield batch
 
 
 def make_progress(iterable, desc):
@@ -430,13 +379,6 @@ def make_progress(iterable, desc):
         mininterval=0.5,
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]",
     )
-
-
-def maybe_wrap_prefetch(loader):
-    if loader is None or DEVICE != "cuda":
-        return loader
-    return DevicePrefetchLoader(loader, DEVICE, USE_CHANNELS_LAST)
-
 
 def get_model():
     from pdetransformer.core.mixed_channels.pde_transformer import PDETransformer
@@ -645,10 +587,10 @@ def run_epoch(
     combo_weight_direction = float(objective_weight_map.get("direction", 0.0))
 
     loss_accum = {
-        "mse": torch.zeros((), device=DEVICE),
-        "grad": torch.zeros((), device=DEVICE),
-        "direction": torch.zeros((), device=DEVICE),
-        "combo": torch.zeros((), device=DEVICE),
+        "mse": 0.0,
+        "grad": 0.0,
+        "direction": 0.0,
+        "combo": 0.0,
     }
     sample_count = 0
     accum_steps = 0
@@ -716,9 +658,9 @@ def run_epoch(
                     accum_steps = 0
 
             batch_size = x.shape[0]
-            loss_accum["mse"] += mse_loss.detach() * batch_size
-            loss_accum["grad"] += grad_loss.detach() * batch_size
-            loss_accum["direction"] += dir_loss.detach() * batch_size
+            loss_accum["mse"] += mse_loss.detach().item() * batch_size
+            loss_accum["grad"] += grad_loss.detach().item() * batch_size
+            loss_accum["direction"] += dir_loss.detach().item() * batch_size
             
             # combo tracking
             combo_val = (
@@ -726,7 +668,7 @@ def run_epoch(
                 + grad_loss.detach() * combo_weight_grad
                 + dir_loss.detach() * combo_weight_direction
             )
-            loss_accum["combo"] += combo_val * batch_size
+            loss_accum["combo"] += combo_val.item() * batch_size
             
             sample_count += batch_size
             if step == 0 or (step + 1) % TQDM_UPDATE_EVERY == 0 or (step + 1) == len(loader):
@@ -739,10 +681,10 @@ def run_epoch(
                 update_progress(progress_bar, latest_loss)
 
     return {
-        "mse": (loss_accum["mse"] / max(1, sample_count)).detach().item(),
-        "grad": (loss_accum["grad"] / max(1, sample_count)).detach().item(),
-        "direction": (loss_accum["direction"] / max(1, sample_count)).detach().item(),
-        "combo": (loss_accum["combo"] / max(1, sample_count)).detach().item(),
+        "mse": loss_accum["mse"] / max(1, sample_count),
+        "grad": loss_accum["grad"] / max(1, sample_count),
+        "direction": loss_accum["direction"] / max(1, sample_count),
+        "combo": loss_accum["combo"] / max(1, sample_count),
     }
 
 
@@ -892,8 +834,8 @@ def main():
             "Lower WARMUP_FRAC or verify frame counts in simulation caches."
         )
     val_ds = MultiSimKarmanDataset(val_sim_infos, mean, std) if val_sim_infos else None
-    train_loader = maybe_wrap_prefetch(build_loader(train_ds, shuffle=True))
-    val_loader = maybe_wrap_prefetch(build_loader(val_ds, shuffle=False)) if val_ds is not None else None
+    train_loader = build_loader(train_ds, shuffle=True)
+    val_loader = build_loader(val_ds, shuffle=False) if val_ds is not None else None
     print(f"Train samples: {len(train_ds)}   Val samples: {len(val_ds) if val_ds is not None else 0}")
 
     zero_norm = ((torch.zeros(3, device=DEVICE) - mean.to(DEVICE)) / std.to(DEVICE)).view(1, 3, 1, 1)
@@ -906,8 +848,6 @@ def main():
     print(f"  Parameters: {n_params:.1f} M")
     if USE_CHANNELS_LAST:
         print("  Memory format: channels_last")
-    if DEVICE == "cuda":
-        print("  Device prefetch: enabled")
 
     optimizer = create_optimizer(model)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.25)
