@@ -83,7 +83,7 @@ DIRECTION_MASK_SMOOTH_PASSES = 0
 DIRECTION_MASK_SMOOTH_KERNEL = 5
 LOSS_WEIGHT_MSE = 1.0
 LOSS_WEIGHT_GRAD = 0.0
-LOSS_WEIGHT_DIRECTION = 0.001
+LOSS_WEIGHT_DIRECTION = 0.02
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
@@ -580,7 +580,7 @@ def get_active_objectives():
 def prepare_fluid_mask(mask, ref_tensor):
     if mask is None:
         return None
-    fluid_mask = (1.0 - mask).to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+    fluid_mask = mask.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
     if fluid_mask.ndim == ref_tensor.ndim - 1:
         fluid_mask = fluid_mask.unsqueeze(1)
     if fluid_mask.ndim != ref_tensor.ndim:
@@ -662,13 +662,12 @@ def run_epoch(
             pred = safe_model_sample(model, x, labels)
             pred = pred.float()
             pred = apply_obstacle_constraints(pred, zero_norm, fluid_mask)
-            y = apply_obstacle_constraints(y, zero_norm, fluid_mask)
 
             if not torch.isfinite(pred).all() or not torch.isfinite(y).all():
                 raise RuntimeError("Non-finite values detected in prediction/target tensors.")
 
             if training:
-                mse_loss = masked_mse_loss(pred, y, fluid_mask)
+                mse_loss = F.mse_loss(pred, y)
                 grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=fluid_mask)
                 loss_to_backprop = (
                     mse_loss * combo_weight_mse
@@ -678,7 +677,7 @@ def run_epoch(
                 if not torch.isfinite(loss_to_backprop):
                     raise RuntimeError("Non-finite training loss encountered.")
             else:
-                mse_loss = masked_mse_loss(pred, y, fluid_mask)
+                mse_loss = F.mse_loss(pred, y)
                 grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=fluid_mask)
 
             if training:
