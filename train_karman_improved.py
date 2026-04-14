@@ -72,7 +72,7 @@ np.random.seed(42)
 SIM_ROOT = "./256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
 OUT_DIR = os.path.join("runs", "karman")
 EPOCHS = 40
-BATCH_SIZE = 24
+BATCH_SIZE = 48
 ACCUM_GRAD = 1
 LR = 1e-5
 VAL_FRAC = 0.10
@@ -91,6 +91,7 @@ DPI_VID = 110
 SKIP_TRAIN = False
 RESUME_CHECKPOINT = None #"./runs/karman/last.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
 MODEL_TYPE = "PDE-S"  # Smallest PDETransformer variant in this repo
+USE_AMP = DEVICE == "cuda" and torch.cuda.is_available()
 # This model is attention-heavy and does many explicit permutes/window reshapes,
 # so channels_last is not a reliable speedup here.
 USE_CHANNELS_LAST = False
@@ -621,6 +622,7 @@ def run_epoch(
     training,
     optimizer=None,
     active_objectives=None,
+    scaler=None,
 ):
     if active_objectives is None:
         active_objectives = get_active_objectives()
@@ -659,7 +661,9 @@ def run_epoch(
             labels = get_labels_fn(x.shape[0])
             fluid_mask = prepare_fluid_mask(mask, y)
 
-            pred = safe_model_sample(model, x, labels)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=USE_AMP):
+                pred = safe_model_sample(model, x, labels)
+            
             pred = pred.float()
             pred = apply_obstacle_constraints(pred, zero_norm, fluid_mask)
 
@@ -681,10 +685,17 @@ def run_epoch(
                 grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=fluid_mask)
 
             if training:
-                (loss_to_backprop / ACCUM_GRAD).backward()
+                if scaler is not None:
+                    scaler.scale(loss_to_backprop / ACCUM_GRAD).backward()
+                else:
+                    (loss_to_backprop / ACCUM_GRAD).backward()
+                
                 accum_steps += 1
 
                 if (step + 1) % ACCUM_GRAD == 0 or (step + 1) == len(loader):
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                        
                     if accum_steps < ACCUM_GRAD:
                         # Correct the final partial accumulation window so its effective gradient
                         # magnitude matches full windows.
@@ -692,8 +703,15 @@ def run_epoch(
                         for param in model.parameters():
                             if param.grad is not None:
                                 param.grad.mul_(scale)
+                                
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
+                    
+                    if scaler is not None:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                        
                     optimizer.zero_grad(set_to_none=True)
                     accum_steps = 0
 
@@ -753,7 +771,8 @@ def save_rollout_video(model_to_render, sim_info, mean, std, zero_norm, get_labe
         labels = get_labels_fn(1)
         fluid_mask = prepare_fluid_mask(mask_tensor, current)
         for _ in range(rollout_len - 1):
-            nxt = safe_model_sample(model_to_render, current, labels)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=USE_AMP):
+                nxt = safe_model_sample(model_to_render, current, labels)
             nxt = nxt.float()
             nxt = apply_obstacle_constraints(nxt, zero_norm, fluid_mask)
             pred_frames.append(nxt[0].cpu().numpy())
@@ -920,6 +939,8 @@ def main():
 
     print(f"  Optimizer mode: AdamW weighted combo over {[name for name, _ in active_objectives]}")
 
+    scaler = torch.amp.GradScaler('cuda', enabled=USE_AMP)
+
     train_losses = {"mse": [], "grad": [], "direction": [], "combo": []}
     val_losses = {"mse": [], "grad": [], "direction": [], "combo": []}
     best_val = math.inf
@@ -968,6 +989,7 @@ def main():
                 training=True,
                 optimizer=optimizer,
                 active_objectives=active_objectives,
+                scaler=scaler,
             )
 
             if val_loader is None:
