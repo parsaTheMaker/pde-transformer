@@ -42,6 +42,18 @@ torch.backends.cudnn.enabled = True
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    except AttributeError:
+        pass
+    try:
+        torch.backends.cudnn.allow_tf32 = True
+    except AttributeError:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        pass
 
 torch.cuda.empty_cache()
 
@@ -91,7 +103,7 @@ DPI_VID = 110
 SKIP_TRAIN = False
 RESUME_CHECKPOINT = None #"./runs/karman/last.ckpt"  # e.g. r"D:\runs\karman\last.ckpt" or "/home/user/last.ckpt"
 MODEL_TYPE = "PDE-S"  # Smallest PDETransformer variant in this repo
-USE_AMP = DEVICE == "cuda" and torch.cuda.is_available()
+USE_AMP = DEVICE == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 # This model is attention-heavy and does many explicit permutes/window reshapes,
 # so channels_last is not a reliable speedup here.
 USE_CHANNELS_LAST = False
@@ -531,9 +543,6 @@ def prepare_fluid_mask(mask, ref_tensor):
     if fluid_mask.shape[0] != ref_tensor.shape[0] or fluid_mask.shape[2:] != ref_tensor.shape[2:]:
         raise ValueError(f"Mask shape {fluid_mask.shape} incompatible with tensor shape {ref_tensor.shape}.")
     return fluid_mask.clamp(0.0, 1.0)
-    if fluid_mask.shape[0] != ref_tensor.shape[0] or fluid_mask.shape[2:] != ref_tensor.shape[2:]:
-        raise ValueError(f"Mask shape {fluid_mask.shape} incompatible with tensor shape {ref_tensor.shape}.")
-    return fluid_mask.clamp(0.0, 1.0)
 
 
 def apply_obstacle_constraints(field, zero_norm, fluid_mask):
@@ -603,7 +612,7 @@ def run_epoch(
             labels = get_labels_fn(x.shape[0])
             fluid_mask = prepare_fluid_mask(mask, y)
 
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=USE_AMP):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
                 pred = safe_model_sample(model, x, labels)
             
             pred = pred.float()
@@ -713,7 +722,7 @@ def save_rollout_video(model_to_render, sim_info, mean, std, zero_norm, get_labe
         labels = get_labels_fn(1)
         fluid_mask = prepare_fluid_mask(mask_tensor, current)
         for _ in range(rollout_len - 1):
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=USE_AMP):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
                 nxt = safe_model_sample(model_to_render, current, labels)
             nxt = nxt.float()
             nxt = apply_obstacle_constraints(nxt, zero_norm, fluid_mask)
