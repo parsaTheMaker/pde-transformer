@@ -84,9 +84,9 @@ np.random.seed(42)
 SIM_ROOT = "./256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
 OUT_DIR = os.path.join("runs", "karman")
 EPOCHS = 40
-BATCH_SIZE = 32
+BATCH_SIZE = 24
 ACCUM_GRAD = 1
-LR = 1e-5
+LR = 4e-5
 VAL_FRAC = 0.10
 WARMUP_FRAC = 0.3
 # Loss configuration
@@ -94,8 +94,17 @@ DIRECTION_LOSS_EPS = 1e-8
 DIRECTION_MASK_SMOOTH_PASSES = 0
 DIRECTION_MASK_SMOOTH_KERNEL = 5
 LOSS_WEIGHT_MSE = 1.0
-LOSS_WEIGHT_GRAD = 0.0
+LOSS_WEIGHT_GRAD = 2.0
 LOSS_WEIGHT_DIRECTION = 0.02
+
+ACTIVE_LOSSES = []
+if LOSS_WEIGHT_MSE > 0:
+    ACTIVE_LOSSES.append("mse")
+if LOSS_WEIGHT_GRAD > 0:
+    ACTIVE_LOSSES.append("grad")
+if LOSS_WEIGHT_DIRECTION > 0:
+    ACTIVE_LOSSES.append("direction")
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
 VID_FRAMES = 50
@@ -107,36 +116,13 @@ USE_AMP = DEVICE == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_
 # This model is attention-heavy and does many explicit permutes/window reshapes,
 # so channels_last is not a reliable speedup here.
 USE_CHANNELS_LAST = False
-NUM_WORKERS = 2
+NUM_WORKERS = max(0, cpu_count() - 5)
 PIN_MEMORY = DEVICE == "cuda"
 CACHE_STATES_FILENAME = "states.float32.npy"
 CACHE_MASK_FILENAME = "obstacle_mask.float32.npy"
-CACHE_WORKERS = 2
+CACHE_WORKERS = max(1, cpu_count() - 5)
+PREFETCH_FACTOR = 2
 TQDM_UPDATE_EVERY = 20
-
-RUNTIME_CUDNN_FALLBACK = False
-
-
-def _is_conv_engine_error(err):
-    msg = str(err).lower()
-    return "unable to find an engine" in msg or "find was unable to find an engine" in msg
-
-
-def safe_model_sample(model, x, labels):
-    global RUNTIME_CUDNN_FALLBACK
-
-    try:
-        return model(x, class_labels=labels).sample
-    except RuntimeError as err:
-        if DEVICE != "cuda" or not _is_conv_engine_error(err):
-            raise
-
-        if not RUNTIME_CUDNN_FALLBACK:
-            RUNTIME_CUDNN_FALLBACK = True
-            print("[warn] CUDA conv engine still failing; enabling CuDNN fallback for forward path.")
-
-        with torch.backends.cudnn.flags(enabled=False, benchmark=False, deterministic=False):
-            return model(x, class_labels=labels).sample
 
 def packed_slice_to_numpy(array):
     return np.array(array, dtype=np.float32, copy=True)
@@ -209,9 +195,9 @@ class MultiSimKarmanDataset(Dataset):
         mask_t = self._mask_tensors.get(sim_idx)
         if mask_t is None:
             mask_np = packed_slice_to_numpy(load_packed_array(self.sims[sim_idx]["packed_mask_path"]))
-            mask_t = torch.from_numpy(mask_np).float().clamp_(0.0, 1.0)
+            mask_t = torch.from_numpy(mask_np).float()
             self._mask_tensors[sim_idx] = mask_t
-        return mask_t.clone()
+        return mask_t
 
     def __getitem__(self, idx):
         sim_idx, frame_idx = self.samples[idx]
@@ -225,7 +211,7 @@ class MultiSimKarmanDataset(Dataset):
         x = torch.from_numpy(x_np)
         y = torch.from_numpy(y_np)
 
-        return x, y, self._get_mask(sim_idx)
+        return x.float(), y.float(), self._get_mask(sim_idx)
 
 
 class GradMagAndDirectionLoss(nn.Module):
@@ -268,54 +254,49 @@ class GradMagAndDirectionLoss(nn.Module):
         return vm
 
     def get_components(self, pred, target, valid_mask=None, spacing=None):
-        pred_g, target_g, m = self._stacked_grads_and_mask(pred, target, valid_mask, spacing)
-        grad_loss = self._grad_mag_loss(pred_g, target_g, m)
-        dir_loss = self._direction_loss_from_grads(pred_g, target_g, m, pred.dtype)
+        pred_grads = self._spatial_grads(pred, spacing=spacing)
+        target_grads = self._spatial_grads(target, spacing=spacing)
+
+        pred_g = torch.stack(pred_grads, dim=2)
+        target_g = torch.stack(target_grads, dim=2)
+
+        m = self._prepare_mask(valid_mask, pred)
+
+        # Gradient Magnitude / Sobolev term
+        grad_diff_sq = (pred_g - target_g).square().sum(dim=2)
+        if m is not None:
+            grad_loss = (grad_diff_sq * m).sum() / (m.sum() + self.eps)
+        else:
+            grad_loss = grad_diff_sq.mean()
+
+        # Gradient Direction term
+        dot = (pred_g * target_g).sum(dim=2)
+        pred_norm = torch.sqrt(pred_g.square().sum(dim=2) + self.eps)
+        target_norm = torch.sqrt(target_g.square().sum(dim=2) + self.eps)
+
+        cos = dot / (pred_norm * target_norm + self.eps)
+        dir_loss_pointwise = 1.0 - cos
+
+        if self.use_smooth_dir_weight:
+            w_dir = target_norm / (target_norm + self.dir_tau)
+        else:
+            w_dir = (target_norm > self.dir_tau).to(dtype=pred.dtype)
+
+        if m is not None:
+            w = w_dir * m
+            dir_loss = (dir_loss_pointwise * w).sum() / (w.sum() + self.eps)
+        else:
+            dir_loss = (dir_loss_pointwise * w_dir).sum() / (w_dir.sum() + self.eps)
 
         return grad_loss, dir_loss
 
     def grad_only(self, pred, target, valid_mask=None, spacing=None):
-        pred_g, target_g, m = self._stacked_grads_and_mask(pred, target, valid_mask, spacing)
-        return self._grad_mag_loss(pred_g, target_g, m)
+        grad_loss, _ = self.get_components(pred, target, valid_mask, spacing)
+        return grad_loss
 
     def direction_only(self, pred, target, valid_mask=None, spacing=None):
-        pred_g, target_g, m = self._stacked_grads_and_mask(pred, target, valid_mask, spacing)
-        return self._direction_loss_from_grads(pred_g, target_g, m, pred.dtype)
-
-    def _stacked_grads_and_mask(self, pred, target, valid_mask=None, spacing=None):
-        pred_grads = self._spatial_grads(pred, spacing=spacing)
-        target_grads = self._spatial_grads(target, spacing=spacing)
-        pred_g = torch.stack(pred_grads, dim=2)
-        target_g = torch.stack(target_grads, dim=2)
-        m = self._prepare_mask(valid_mask, pred)
-        return pred_g, target_g, m
-
-    def _grad_mag_loss(self, pred_g, target_g, mask):
-        grad_diff_sq = (pred_g - target_g).square().sum(dim=2)
-        if mask is not None:
-            return (grad_diff_sq * mask).sum() / (mask.sum() + self.eps)
-        return grad_diff_sq.mean()
-
-    def _direction_loss_from_grads(self, pred_g, target_g, mask, dtype):
-        dot = (pred_g * target_g).sum(dim=2)
-        
-        target_norm_raw = torch.sqrt(target_g.square().sum(dim=2))
-        
-        pred_norm = torch.sqrt(pred_g.square().sum(dim=2) + self.eps)
-        target_norm = torch.sqrt(target_g.square().sum(dim=2) + self.eps)
-
-        cos = dot / (pred_norm * target_norm)
-        dir_loss_pointwise = 1.0 - cos
-
-        if self.use_smooth_dir_weight:
-            w_dir = target_norm_raw / (target_norm_raw + self.dir_tau)
-        else:
-            w_dir = (target_norm_raw > self.dir_tau).to(dtype=dtype)
-
-        if mask is not None:
-            w = w_dir * mask
-            return (dir_loss_pointwise * w).sum() / (w.sum() + self.eps)
-        return (dir_loss_pointwise * w_dir).sum() / (w_dir.sum() + self.eps)
+        _, dir_loss = self.get_components(pred, target, valid_mask, spacing)
+        return dir_loss
 
     def _spatial_grads(self, x: torch.Tensor, spacing=None):
         if x.ndim == 4:
@@ -377,9 +358,59 @@ def build_loader(dataset, shuffle):
     }
     if NUM_WORKERS > 0:
         kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = PREFETCH_FACTOR
     if PIN_MEMORY:
         kwargs["pin_memory_device"] = DEVICE
     return DataLoader(dataset, **kwargs)
+
+
+class DevicePrefetchLoader:
+    def __init__(self, loader, device, use_channels_last):
+        self.loader = loader
+        self.device = device
+        self.use_channels_last = use_channels_last
+        self.enabled = device == "cuda" and torch.cuda.is_available()
+        self.stream = torch.cuda.Stream(device=device) if self.enabled else None
+
+    def __len__(self):
+        return len(self.loader)
+
+    def _move_batch(self, batch):
+        x, y, mask = batch
+        x = x.to(self.device, non_blocking=True)
+        y = y.to(self.device, non_blocking=True)
+        mask = mask.to(self.device, non_blocking=True)
+        if self.use_channels_last:
+            x = x.contiguous(memory_format=torch.channels_last)
+            y = y.contiguous(memory_format=torch.channels_last)
+            mask = mask.contiguous(memory_format=torch.channels_last)
+        return x, y, mask
+
+    def __iter__(self):
+        if not self.enabled:
+            for batch in self.loader:
+                yield batch
+            return
+
+        loader_iter = iter(self.loader)
+        next_batch = None
+
+        def preload():
+            nonlocal next_batch
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                next_batch = None
+                return
+            with torch.cuda.stream(self.stream):
+                next_batch = self._move_batch(batch)
+
+        preload()
+        while next_batch is not None:
+            torch.cuda.current_stream(self.device).wait_stream(self.stream)
+            batch = next_batch
+            preload()
+            yield batch
 
 
 def make_progress(iterable, desc):
@@ -391,6 +422,13 @@ def make_progress(iterable, desc):
         mininterval=0.5,
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]",
     )
+
+
+def maybe_wrap_prefetch(loader):
+    if loader is None or DEVICE != "cuda":
+        return loader
+    return DevicePrefetchLoader(loader, DEVICE, USE_CHANNELS_LAST)
+
 
 def get_model():
     from pdetransformer.core.mixed_channels.pde_transformer import PDETransformer
@@ -424,25 +462,30 @@ def create_optimizer(model):
 
 
 def move_batch_to_device(x, y, mask):
-    if x.device.type != DEVICE:
+    if DEVICE != "cuda":
         x = x.to(DEVICE, non_blocking=PIN_MEMORY)
-    if y.device.type != DEVICE:
         y = y.to(DEVICE, non_blocking=PIN_MEMORY)
-    if mask.device.type != DEVICE:
         mask = mask.to(DEVICE, non_blocking=PIN_MEMORY)
-    if USE_CHANNELS_LAST:
-        x = x.contiguous(memory_format=torch.channels_last)
-        y = y.contiguous(memory_format=torch.channels_last)
-        mask = mask.contiguous(memory_format=torch.channels_last)
+        if USE_CHANNELS_LAST:
+            x = x.contiguous(memory_format=torch.channels_last)
+            y = y.contiguous(memory_format=torch.channels_last)
+            mask = mask.contiguous(memory_format=torch.channels_last)
     return x, y, mask
 
 
-def update_progress(progress_bar, latest_loss):
+def update_progress(progress_bar, loss_dict, sample_count):
+    denom = max(1, sample_count)
+    avg_loss_dict = {}
+    for key, value in loss_dict.items():
+        avg = value / denom
+        if isinstance(avg, torch.Tensor):
+            avg = avg.detach().item()
+        avg_loss_dict[key] = avg
     progress_bar.set_postfix(
-        mse=f"{latest_loss.get('mse', 0.0):.6f}",
-        grad=f"{latest_loss.get('grad', 0.0):.6f}",
-        dir=f"{latest_loss.get('direction', 0.0):.6f}",
-        combo=f"{latest_loss.get('combo', 0.0):.6f}"
+        mse=f"{avg_loss_dict['mse']:.6f}",
+        grad=f"{avg_loss_dict['grad']:.6f}",
+        dir=f"{avg_loss_dict['direction']:.6f}",
+        combo=f"{avg_loss_dict['combo']:.6f}"
     )
 
 
@@ -523,86 +566,39 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")
 
 
-def get_active_objectives():
-    objectives = [
-        ("mse", float(LOSS_WEIGHT_MSE)),
-        ("grad", float(LOSS_WEIGHT_GRAD)),
-        ("direction", float(LOSS_WEIGHT_DIRECTION)),
-    ]
-    return [(name, weight) for name, weight in objectives if weight != 0.0]
+def fast_get_gradient_vector(network):
+    """Optimized method to extract gradients without creating O(N) memory fragments."""
+    with torch.no_grad():
+        grads = [par.grad.data.view(-1) for par in network.parameters() if par.grad is not None]
+        return torch.cat(grads) if grads else None
 
 
-def prepare_fluid_mask(mask, ref_tensor):
-    if mask is None:
+def sanitize_gradient_vector(grad_vec):
+    """Return a finite gradient vector or None if no usable gradient exists."""
+    if grad_vec is None:
         return None
-    fluid_mask = mask.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
-    if fluid_mask.ndim == ref_tensor.ndim - 1:
-        fluid_mask = fluid_mask.unsqueeze(1)
-    if fluid_mask.ndim != ref_tensor.ndim:
-        raise ValueError(f"Mask ndim {fluid_mask.ndim} incompatible with tensor ndim {ref_tensor.ndim}.")
-    if fluid_mask.shape[0] != ref_tensor.shape[0] or fluid_mask.shape[2:] != ref_tensor.shape[2:]:
-        raise ValueError(f"Mask shape {fluid_mask.shape} incompatible with tensor shape {ref_tensor.shape}.")
-    return fluid_mask.clamp(0.0, 1.0)
+    if torch.isfinite(grad_vec).all():
+        return grad_vec
+    return torch.nan_to_num(grad_vec, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def apply_obstacle_constraints(field, zero_norm, fluid_mask):
-    if fluid_mask is None:
-        return field
-    return torch.lerp(zero_norm, field, fluid_mask)
-
-
-def masked_mse_loss(pred, target, fluid_mask, eps=1e-8):
-    if fluid_mask is None:
-        return F.mse_loss(pred, target)
-    if fluid_mask.shape[1] == 1 and pred.shape[1] != 1:
-        weights = fluid_mask.expand(-1, pred.shape[1], *pred.shape[2:])
-    elif fluid_mask.shape[1] == pred.shape[1]:
-        weights = fluid_mask
-    else:
-        raise ValueError(f"Mask channels {fluid_mask.shape[1]} must be 1 or match tensor channels {pred.shape[1]}.")
-    diff_sq = (pred - target).square()
-    return (diff_sq * weights).sum() / (weights.sum() + eps)
-
-
-def run_epoch(
-    model,
-    loader,
-    zero_norm,
-    get_labels_fn,
-    loss_fn,
-    training,
-    optimizer=None,
-    active_objectives=None,
-    scaler=None,
-):
-    if active_objectives is None:
-        active_objectives = get_active_objectives()
-
-    if training and not active_objectives:
-        raise ValueError("All loss weights are zero; at least one training objective must be active.")
-
-    objective_weight_map = {name: weight for name, weight in active_objectives}
-
+def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimizer=None, operator=None, global_step=0):
     if training:
         model.train()
         optimizer.zero_grad(set_to_none=True)
+        from conflictfree.utils import apply_gradient_vector
         desc = "tr"
     else:
         model.eval()
         desc = "va"
 
-    combo_weight_mse = float(objective_weight_map.get("mse", 0.0))
-    combo_weight_grad = float(objective_weight_map.get("grad", 0.0))
-    combo_weight_direction = float(objective_weight_map.get("direction", 0.0))
-
     loss_accum = {
-        "mse": 0.0,
-        "grad": 0.0,
-        "direction": 0.0,
-        "combo": 0.0,
+        "mse": torch.zeros((), device=DEVICE),
+        "grad": torch.zeros((), device=DEVICE),
+        "direction": torch.zeros((), device=DEVICE),
+        "combo": torch.zeros((), device=DEVICE),
     }
     sample_count = 0
-    accum_steps = 0
 
     context = torch.enable_grad if training else torch.inference_mode
     with context():
@@ -610,90 +606,108 @@ def run_epoch(
         for step, (x, y, mask) in enumerate(progress_bar):
             x, y, mask = move_batch_to_device(x, y, mask)
             labels = get_labels_fn(x.shape[0])
-            fluid_mask = prepare_fluid_mask(mask, y)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
-                pred = safe_model_sample(model, x, labels)
-            
+                pred = model(x, class_labels=labels).sample
             pred = pred.float()
-            pred = apply_obstacle_constraints(pred, zero_norm, fluid_mask)
-
-            if not torch.isfinite(pred).all() or not torch.isfinite(y).all():
-                raise RuntimeError("Non-finite values detected in prediction/target tensors.")
+            pred = torch.lerp(zero_norm, pred, mask)
 
             if training:
-                mse_loss = F.mse_loss(pred, y)
-                grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=fluid_mask)
-                loss_to_backprop = (
-                    mse_loss * combo_weight_mse
-                    + grad_loss * combo_weight_grad
-                    + dir_loss * combo_weight_direction
-                )
-                if not torch.isfinite(loss_to_backprop):
-                    raise RuntimeError("Non-finite training loss encountered.")
+                if len(ACTIVE_LOSSES) == 0:
+                    active_loss_name = "mse"
+                    active_idx = 0
+                else:
+                    active_idx = (global_step + step) % len(ACTIVE_LOSSES)
+                    active_loss_name = ACTIVE_LOSSES[active_idx]
+
+                if active_loss_name == "mse":
+                    mse_loss = F.mse_loss(pred, y)
+                    loss_to_backprop = mse_loss * LOSS_WEIGHT_MSE
+                    with torch.no_grad():
+                        grad_loss, dir_loss = loss_fn.get_components(pred.detach(), y, valid_mask=mask)
+                elif active_loss_name == "grad":
+                    grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
+                    loss_to_backprop = grad_loss * LOSS_WEIGHT_GRAD
+                    with torch.no_grad():
+                        mse_loss = F.mse_loss(pred, y)
+                    dir_loss = dir_loss.detach()
+                elif active_loss_name == "direction":
+                    grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
+                    loss_to_backprop = dir_loss * LOSS_WEIGHT_DIRECTION
+                    with torch.no_grad():
+                        mse_loss = F.mse_loss(pred, y)
+                    grad_loss = grad_loss.detach()
             else:
                 mse_loss = F.mse_loss(pred, y)
-                grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=fluid_mask)
+                grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
 
             if training:
-                if scaler is not None:
-                    scaler.scale(loss_to_backprop / ACCUM_GRAD).backward()
+                if step % ACCUM_GRAD != 0:
+                    accum_grad = sanitize_gradient_vector(fast_get_gradient_vector(model))
                 else:
-                    (loss_to_backprop / ACCUM_GRAD).backward()
+                    accum_grad = None
+
+                optimizer.zero_grad(set_to_none=True)
                 
-                accum_steps += 1
+                (loss_to_backprop / ACCUM_GRAD).backward()
+                
+                grad = sanitize_gradient_vector(fast_get_gradient_vector(model))
+                if grad is None:
+                    continue
+
+                if len(ACTIVE_LOSSES) > 1:
+                    try:
+                        g_config = operator.calculate_gradient(active_idx, grad)
+                    except torch._C._LinAlgError:
+                        # Fallback: use the current finite gradient if ConFIG fails numerically.
+                        g_config = grad
+                    except RuntimeError as err:
+                        msg = str(err).lower()
+                        if "cusolver" in msg or "lstsq" in msg or "nan" in msg:
+                            g_config = grad
+                        else:
+                            raise
+                else:
+                    g_config = grad
+
+                g_config = sanitize_gradient_vector(g_config)
+                if g_config is None:
+                    continue
+                
+                if accum_grad is not None:
+                    g_config = accum_grad + g_config
+                    
+                apply_gradient_vector(model, g_config)
+                
+                del grad, g_config
 
                 if (step + 1) % ACCUM_GRAD == 0 or (step + 1) == len(loader):
-                    if scaler is not None:
-                        scaler.unscale_(optimizer)
-                        
-                    if accum_steps < ACCUM_GRAD:
-                        # Correct the final partial accumulation window so its effective gradient
-                        # magnitude matches full windows.
-                        scale = ACCUM_GRAD / max(1, accum_steps)
-                        for param in model.parameters():
-                            if param.grad is not None:
-                                param.grad.mul_(scale)
-                                
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    
-                    if scaler is not None:
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        optimizer.step()
-                        
+                    optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-                    accum_steps = 0
 
             batch_size = x.shape[0]
-            loss_accum["mse"] += mse_loss.detach().item() * batch_size
-            loss_accum["grad"] += grad_loss.detach().item() * batch_size
-            loss_accum["direction"] += dir_loss.detach().item() * batch_size
+            loss_accum["mse"] += mse_loss.detach() * batch_size
+            loss_accum["grad"] += grad_loss.detach() * batch_size
+            loss_accum["direction"] += dir_loss.detach() * batch_size
             
             # combo tracking
             combo_val = (
-                mse_loss.detach() * combo_weight_mse
-                + grad_loss.detach() * combo_weight_grad
-                + dir_loss.detach() * combo_weight_direction
+                mse_loss.detach() * LOSS_WEIGHT_MSE
+                + grad_loss.detach() * LOSS_WEIGHT_GRAD
+                + dir_loss.detach() * LOSS_WEIGHT_DIRECTION
             )
-            loss_accum["combo"] += combo_val.item() * batch_size
+            loss_accum["combo"] += combo_val * batch_size
             
             sample_count += batch_size
             if step == 0 or (step + 1) % TQDM_UPDATE_EVERY == 0 or (step + 1) == len(loader):
-                latest_loss = {
-                    "mse": mse_loss.detach().item(),
-                    "grad": grad_loss.detach().item(),
-                    "direction": dir_loss.detach().item(),
-                    "combo": combo_val.item()
-                }
-                update_progress(progress_bar, latest_loss)
+                update_progress(progress_bar, loss_accum, sample_count)
 
     return {
-        "mse": loss_accum["mse"] / max(1, sample_count),
-        "grad": loss_accum["grad"] / max(1, sample_count),
-        "direction": loss_accum["direction"] / max(1, sample_count),
-        "combo": loss_accum["combo"] / max(1, sample_count),
+        "mse": (loss_accum["mse"] / max(1, sample_count)).detach().item(),
+        "grad": (loss_accum["grad"] / max(1, sample_count)).detach().item(),
+        "direction": (loss_accum["direction"] / max(1, sample_count)).detach().item(),
+        "combo": (loss_accum["combo"] / max(1, sample_count)).detach().item(),
     }
 
 
@@ -720,12 +734,11 @@ def save_rollout_video(model_to_render, sim_info, mean, std, zero_norm, get_labe
     with torch.inference_mode():
         current = torch.tensor(gt_norm[0], dtype=torch.float32, device=DEVICE).unsqueeze(0)
         labels = get_labels_fn(1)
-        fluid_mask = prepare_fluid_mask(mask_tensor, current)
         for _ in range(rollout_len - 1):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
-                nxt = safe_model_sample(model_to_render, current, labels)
+                nxt = model_to_render(current, class_labels=labels).sample
             nxt = nxt.float()
-            nxt = apply_obstacle_constraints(nxt, zero_norm, fluid_mask)
+            nxt = torch.lerp(zero_norm, nxt, mask_tensor)
             pred_frames.append(nxt[0].cpu().numpy())
             current = nxt
 
@@ -837,14 +850,9 @@ def main():
     print(f"  per-channel std:  {std.numpy().round(5)}")
 
     train_ds = MultiSimKarmanDataset(train_sim_infos, mean, std)
-    if len(train_ds) == 0:
-        raise RuntimeError(
-            "Training dataset is empty after warmup trimming. "
-            "Lower WARMUP_FRAC or verify frame counts in simulation caches."
-        )
     val_ds = MultiSimKarmanDataset(val_sim_infos, mean, std) if val_sim_infos else None
-    train_loader = build_loader(train_ds, shuffle=True)
-    val_loader = build_loader(val_ds, shuffle=False) if val_ds is not None else None
+    train_loader = maybe_wrap_prefetch(build_loader(train_ds, shuffle=True))
+    val_loader = maybe_wrap_prefetch(build_loader(val_ds, shuffle=False)) if val_ds is not None else None
     print(f"Train samples: {len(train_ds)}   Val samples: {len(val_ds) if val_ds is not None else 0}")
 
     zero_norm = ((torch.zeros(3, device=DEVICE) - mean.to(DEVICE)) / std.to(DEVICE)).view(1, 3, 1, 1)
@@ -857,6 +865,8 @@ def main():
     print(f"  Parameters: {n_params:.1f} M")
     if USE_CHANNELS_LAST:
         print("  Memory format: channels_last")
+    if DEVICE == "cuda":
+        print("  Device prefetch: enabled")
 
     optimizer = create_optimizer(model)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.25)
@@ -879,16 +889,9 @@ def main():
     def get_labels(batch_size):
         return task_label.expand(batch_size)
 
-    active_objectives = get_active_objectives()
-    if not active_objectives:
-        raise ValueError(
-            "All loss weights are zero. Set at least one of "
-            "LOSS_WEIGHT_MSE / LOSS_WEIGHT_GRAD / LOSS_WEIGHT_DIRECTION to a non-zero value."
-        )
-
-    print(f"  Optimizer mode: AdamW weighted combo over {[name for name, _ in active_objectives]}")
-
-    scaler = torch.amp.GradScaler('cuda', enabled=USE_AMP)
+    from conflictfree.momentum_operator import PseudoMomentumOperator
+    operator = PseudoMomentumOperator(num_vectors=max(1, len(ACTIVE_LOSSES)))
+    global_step = 0
 
     train_losses = {"mse": [], "grad": [], "direction": [], "combo": []}
     val_losses = {"mse": [], "grad": [], "direction": [], "combo": []}
@@ -937,9 +940,10 @@ def main():
                 loss_fn=loss_fn,
                 training=True,
                 optimizer=optimizer,
-                active_objectives=active_objectives,
-                scaler=scaler,
+                operator=operator,
+                global_step=global_step,
             )
+            global_step += len(train_loader)
 
             if val_loader is None:
                 val_loss = {"mse": float("nan"), "grad": float("nan"), "direction": float("nan"), "combo": float("nan")}
@@ -951,7 +955,6 @@ def main():
                     get_labels_fn=get_labels,
                     loss_fn=loss_fn,
                     training=False,
-                    active_objectives=active_objectives,
                 )
 
             scheduler.step()
@@ -965,12 +968,8 @@ def main():
             val_losses["direction"].append(val_loss["direction"])
             val_losses["combo"].append(val_loss["combo"])
 
-            monitored_combo = val_loss["combo"]
-            if not math.isfinite(monitored_combo):
-                monitored_combo = train_loss["combo"]
-
-            if monitored_combo < best_val:
-                best_val = monitored_combo
+            if val_loss["combo"] < best_val:
+                best_val = val_loss["combo"]
                 best_marker = " ← best combo"
             else:
                 best_marker = ""
@@ -990,9 +989,9 @@ def main():
             epoch_log_note = "best" if best_marker else ""
             if loss_log_path:
                 log_line = (
-                    f"{datetime.now().isoformat()} {epoch} {current_lr:.2e} "
-                    f"{train_loss['mse']:.6f} {train_loss['grad']:.6f} {train_loss['direction']:.6f} {train_loss['combo']:.6f} "
-                    f"{val_loss['mse']:.6f} {val_loss['grad']:.6f} {val_loss['direction']:.6f} {val_loss['combo']:.6f} {epoch_log_note}\n"
+                    f"{datetime.now().isoformat()} epoch={epoch} lr={current_lr:.2e} "
+                    f"train_mse={train_loss['mse']:.6f} train_grad={train_loss['grad']:.6f} train_dir={train_loss['direction']:.6f} train_combo={train_loss['combo']:.6f} "
+                    f"val_mse={val_loss['mse']:.6f} val_grad={val_loss['grad']:.6f} val_dir={val_loss['direction']:.6f} val_combo={val_loss['combo']:.6f} {epoch_log_note}\n"
                 )
                 with open(loss_log_path, "a", encoding="utf-8") as log_file:
                     log_file.write(log_line)
