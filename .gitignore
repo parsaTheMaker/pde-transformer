@@ -189,3 +189,4 @@ error_report.md
 paired_frame_metrics.csv
 stepwise_mean_metrics.csv
 *.csv
+data/

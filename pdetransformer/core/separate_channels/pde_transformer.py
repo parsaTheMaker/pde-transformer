@@ -16,7 +16,7 @@ import collections.abc
 import numpy as np
 from timm.layers import trunc_normal_, DropPath
 import torch
-from transformers.pytorch_utils import meshgrid, find_pruneable_heads_and_indices, prune_linear_layer
+#from transformers.pytorch_utils import meshgrid, find_pruneable_heads_and_indices, prune_linear_layer
 
 from ..mixed_channels.udit import FinalLayer, precompute_freqs_cis_2d, apply_rotary_emb
 from ..mixed_channels.pde_transformer import Mlp

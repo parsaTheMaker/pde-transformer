@@ -6,6 +6,17 @@ from multiprocessing import get_context
 import numpy as np
 
 
+def _discover_density_files(sim_dir):
+    candidates = [
+        sorted(glob.glob(os.path.join(sim_dir, "density_*.npz"))),
+        sorted(glob.glob(os.path.join(sim_dir, "rho_*.npz"))),
+    ]
+    for files in candidates:
+        if files:
+            return files
+    return []
+
+
 def load_npz_array(path):
     with np.load(path) as data:
         return data["arr_0"].astype(np.float32)
@@ -24,17 +35,23 @@ def discover_simulations(root_dir):
     for sim_dir in sim_dirs:
         vel_files = sorted(glob.glob(os.path.join(sim_dir, "velocity_*.npz")))
         pre_files = sorted(glob.glob(os.path.join(sim_dir, "pressure_*.npz")))
+        den_files = _discover_density_files(sim_dir)
         if not vel_files or not pre_files:
             continue
         if len(vel_files) != len(pre_files):
             raise RuntimeError(
                 f"Frame count mismatch in {sim_dir}: vel={len(vel_files)} pre={len(pre_files)}"
             )
+        if den_files and len(vel_files) != len(den_files):
+            raise RuntimeError(
+                f"Frame count mismatch in {sim_dir}: vel={len(vel_files)} den={len(den_files)}"
+            )
         sim_infos.append(
             {
                 "dir": sim_dir,
                 "vel": vel_files,
                 "pre": pre_files,
+                "den": den_files,
                 "mask_path": os.path.join(sim_dir, "obstacle_mask.npz"),
                 "n_frames": len(vel_files),
             }
@@ -56,6 +73,8 @@ def _get_sim_cache_paths(sim_dir, states_filename, mask_filename):
 def _infer_sim_shapes(sim_info):
     vel0 = load_npz_array(sim_info["vel"][0])
     pre0 = load_npz_array(sim_info["pre"][0])
+    den_files = sim_info.get("den") or []
+    den0 = load_npz_array(den_files[0]) if den_files else None
     if vel0.ndim != 3 or vel0.shape[0] != 2:
         raise RuntimeError(f"Unexpected velocity shape in {sim_info['dir']}: {vel0.shape}")
     if pre0.ndim != 3 or pre0.shape[0] != 1:
@@ -64,7 +83,17 @@ def _infer_sim_shapes(sim_info):
         raise RuntimeError(
             f"Velocity/pressure spatial shape mismatch in {sim_info['dir']}: {vel0.shape} vs {pre0.shape}"
         )
-    return (sim_info["n_frames"], 3, vel0.shape[1], vel0.shape[2]), (1, vel0.shape[1], vel0.shape[2])
+    n_channels = 3
+    if den0 is not None:
+        if den0.ndim != 3 or den0.shape[0] != 1:
+            raise RuntimeError(f"Unexpected density shape in {sim_info['dir']}: {den0.shape}")
+        if vel0.shape[1:] != den0.shape[1:]:
+            raise RuntimeError(
+                f"Velocity/density spatial shape mismatch in {sim_info['dir']}: {vel0.shape} vs {den0.shape}"
+            )
+        n_channels = 4
+
+    return (sim_info["n_frames"], n_channels, vel0.shape[1], vel0.shape[2]), (1, vel0.shape[1], vel0.shape[2])
 
 
 def _load_source_mask(sim_info, expected_mask_shape):
@@ -140,11 +169,15 @@ def _build_sim_cache(sim_info):
             dtype=np.float32,
             shape=states_shape,
         )
+        den_files = sim_info.get("den") or []
         for frame_idx, (vel_path, pre_path) in enumerate(zip(sim_info["vel"], sim_info["pre"])):
             vel = load_npz_array(vel_path)
             pre = load_npz_array(pre_path)
             states_mm[frame_idx, :2] = vel
             states_mm[frame_idx, 2:3] = pre
+            if den_files:
+                den = load_npz_array(den_files[frame_idx])
+                states_mm[frame_idx, 3:4] = den
         states_mm.flush()
         del states_mm
         os.replace(tmp_states_path, states_path)

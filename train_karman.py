@@ -87,10 +87,10 @@ np.random.seed(42)
 
 # User-editable configuration.
 # Use normal Python values here instead of environment variables.
-SIM_ROOT = "data/256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
-OUT_DIR = os.path.join("runs", "karman_mse")
+SIM_ROOT = "/home/parsa/pde-transformer/data/256_inc"  # e.g. r"D:\data\256_inc" or "/data/256_inc"
+OUT_DIR = os.path.join("runs", "karman_mse_grad_dir_NoErosion")
 EPOCHS = 40
-BATCH_SIZE = 20
+BATCH_SIZE = 12
 ACCUM_GRAD = 1
 LR = 4e-5
 VAL_FRAC = 0.10
@@ -100,9 +100,9 @@ DIRECTION_LOSS_EPS = 1e-8
 DIRECTION_MASK_SMOOTH_PASSES = 0
 DIRECTION_MASK_SMOOTH_KERNEL = 5
 LOSS_WEIGHT_MSE = 1.0
-LOSS_WEIGHT_GRAD = 0.0
-LOSS_WEIGHT_DIRECTION = 0.0
-LOSS_MASK_EROSION_RADIUS = 1
+LOSS_WEIGHT_GRAD = 2.0
+LOSS_WEIGHT_DIRECTION = 0.02
+LOSS_MASK_EROSION_RADIUS = 0
 
 ACTIVE_LOSSES = []
 if LOSS_WEIGHT_MSE > 0:
@@ -111,6 +111,8 @@ if LOSS_WEIGHT_GRAD > 0:
     ACTIVE_LOSSES.append("grad")
 if LOSS_WEIGHT_DIRECTION > 0:
     ACTIVE_LOSSES.append("direction")
+
+TASK_IMPORTANCE = {"mse": 4.0, "grad": 1.0, "direction": 1.0}
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FPS_VID = 10
@@ -123,11 +125,11 @@ USE_AMP = DEVICE == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_
 # This model is attention-heavy and does many explicit permutes/window reshapes,
 # so channels_last is not a reliable speedup here.
 USE_CHANNELS_LAST = False
-NUM_WORKERS = max(0, cpu_count() - 5)
+NUM_WORKERS = 3
 PIN_MEMORY = DEVICE == "cuda"
 CACHE_STATES_FILENAME = "states.float32.npy"
 CACHE_MASK_FILENAME = "obstacle_mask.float32.npy"
-CACHE_WORKERS = max(1, cpu_count() - 5)
+CACHE_WORKERS = 3
 PREFETCH_FACTOR = 2
 TQDM_UPDATE_EVERY = 20
 
@@ -305,12 +307,11 @@ class GradMagAndDirectionLoss(nn.Module):
             grad_loss = grad_diff_sq.mean()
 
         # Gradient Direction term
-        dot = (pred_g * target_g).sum(dim=2)
-        pred_norm = torch.sqrt(pred_g.square().sum(dim=2) + self.eps)
-        target_norm = torch.sqrt(target_g.square().sum(dim=2) + self.eps)
-
-        cos = dot / (pred_norm * target_norm + self.eps)
+        cos = F.cosine_similarity(pred_g, target_g, dim=2, eps=self.eps)
         dir_loss_pointwise = 1.0 - cos
+
+        # Calculate target_norm without eps under sqrt since target requires no gradients here
+        target_norm = torch.sqrt(target_g.square().sum(dim=2))
 
         if self.use_smooth_dir_weight:
             w_dir = target_norm / (target_norm + self.dir_tau)
@@ -611,27 +612,10 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")
 
 
-def fast_get_gradient_vector(network):
-    """Optimized method to extract gradients without creating O(N) memory fragments."""
-    with torch.no_grad():
-        grads = [par.grad.data.view(-1) for par in network.parameters() if par.grad is not None]
-        return torch.cat(grads) if grads else None
-
-
-def sanitize_gradient_vector(grad_vec):
-    """Return a finite gradient vector or None if no usable gradient exists."""
-    if grad_vec is None:
-        return None
-    if torch.isfinite(grad_vec).all():
-        return grad_vec
-    return torch.nan_to_num(grad_vec, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimizer=None, operator=None, global_step=0):
+def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimizer=None, global_step=0, lambda_weights=None, optimizer_lambda=None, initial_loss_vals=None):
     if training:
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        from conflictfree.utils import apply_gradient_vector
         desc = "tr"
     else:
         model.eval()
@@ -657,73 +641,67 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimi
             pred = pred.float()
 
             if training:
-                if len(ACTIVE_LOSSES) == 0:
-                    active_loss_name = "mse"
-                    active_idx = 0
+                mse_loss = F.mse_loss(pred, y)
+                grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
+                
+                loss_vec = []
+                for loss_name in ACTIVE_LOSSES:
+                    if loss_name == "mse":
+                        loss_vec.append(mse_loss * LOSS_WEIGHT_MSE)
+                    elif loss_name == "grad":
+                        loss_vec.append(grad_loss * LOSS_WEIGHT_GRAD)
+                    elif loss_name == "direction":
+                        loss_vec.append(dir_loss * LOSS_WEIGHT_DIRECTION)
+                        
+                if len(loss_vec) > 0:
+                    loss_vec = torch.stack(loss_vec)
                 else:
-                    active_idx = (global_step + step) % len(ACTIVE_LOSSES)
-                    active_loss_name = ACTIVE_LOSSES[active_idx]
+                    loss_vec = torch.tensor([mse_loss * LOSS_WEIGHT_MSE], device=pred.device, requires_grad=True)
 
-                if active_loss_name == "mse":
-                    mse_loss = F.mse_loss(pred, y)
-                    loss_to_backprop = mse_loss * LOSS_WEIGHT_MSE
-                    with torch.no_grad():
-                        grad_loss, dir_loss = loss_fn.get_components(pred.detach(), y, valid_mask=mask)
-                elif active_loss_name == "grad":
-                    grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
-                    loss_to_backprop = grad_loss * LOSS_WEIGHT_GRAD
-                    with torch.no_grad():
-                        mse_loss = F.mse_loss(pred, y)
-                    dir_loss = dir_loss.detach()
-                elif active_loss_name == "direction":
-                    grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
-                    loss_to_backprop = dir_loss * LOSS_WEIGHT_DIRECTION
-                    with torch.no_grad():
-                        mse_loss = F.mse_loss(pred, y)
-                    grad_loss = grad_loss.detach()
+                if initial_loss_vals is None and lambda_weights is not None:
+                    initial_loss_vals = loss_vec.detach().clone()
+                    
+                if lambda_weights is not None:
+                    weighted_losses = lambda_weights * loss_vec
+                    loss_to_backprop = weighted_losses.sum()
+                else:
+                    loss_to_backprop = loss_vec.sum()
             else:
                 mse_loss = F.mse_loss(pred, y)
                 grad_loss, dir_loss = loss_fn.get_components(pred, y, valid_mask=mask)
 
             if training:
-                if step % ACCUM_GRAD != 0:
-                    accum_grad = sanitize_gradient_vector(fast_get_gradient_vector(model))
-                else:
-                    accum_grad = None
-
-                optimizer.zero_grad(set_to_none=True)
+                do_gradnorm = lambda_weights is not None and (step + 1) % ACCUM_GRAD == 0
                 
-                (loss_to_backprop / ACCUM_GRAD).backward()
-                
-                grad = sanitize_gradient_vector(fast_get_gradient_vector(model))
-                if grad is None:
-                    continue
+                (loss_to_backprop / ACCUM_GRAD).backward(retain_graph=do_gradnorm)
 
-                if len(ACTIVE_LOSSES) > 1:
-                    try:
-                        g_config = operator.calculate_gradient(active_idx, grad)
-                    except torch._C._LinAlgError:
-                        # Fallback: use the current finite gradient if ConFIG fails numerically.
-                        g_config = grad
-                    except RuntimeError as err:
-                        msg = str(err).lower()
-                        if "cusolver" in msg or "lstsq" in msg or "nan" in msg:
-                            g_config = grad
-                        else:
-                            raise
-                else:
-                    g_config = grad
-
-                g_config = sanitize_gradient_vector(g_config)
-                if g_config is None:
-                    continue
-                
-                if accum_grad is not None:
-                    g_config = accum_grad + g_config
+                if do_gradnorm:
+                    last_layer_weight = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2][-1]
                     
-                apply_gradient_vector(model, g_config)
-                
-                del grad, g_config
+                    G_i = []
+                    optimizer_lambda.zero_grad(set_to_none=True)
+                    for i in range(len(loss_vec)):
+                        grad_w = torch.autograd.grad(loss_vec[i], last_layer_weight, retain_graph=True)[0]
+                        G_i.append(lambda_weights[i] * torch.norm(grad_w))
+                    
+                    G_i = torch.stack(G_i)
+                    mean_G = G_i.mean().detach()
+                    L_i_ratio = loss_vec.detach() / initial_loss_vals
+                    r_i = L_i_ratio / L_i_ratio.mean()
+                    
+                    importance = torch.tensor([TASK_IMPORTANCE[n] for n in ACTIVE_LOSSES], device=G_i.device)
+                    importance = importance / importance.mean()
+                    
+                    constant_term = mean_G * importance * (r_i ** 1.5)
+                    
+                    grad_norm_loss = torch.sum(torch.abs(G_i - constant_term.detach()))
+                    grad_norm_loss.backward()
+                    
+                    optimizer_lambda.step()
+                    
+                    with torch.no_grad():
+                        normalize_coeff = len(loss_vec) / lambda_weights.sum()
+                        lambda_weights.data = lambda_weights.data * normalize_coeff
 
                 if (step + 1) % ACCUM_GRAD == 0 or (step + 1) == len(loader):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -752,7 +730,7 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, loss_fn, training, optimi
         "grad": (loss_accum["grad"] / max(1, sample_count)).detach().item(),
         "direction": (loss_accum["direction"] / max(1, sample_count)).detach().item(),
         "combo": (loss_accum["combo"] / max(1, sample_count)).detach().item(),
-    }
+    }, initial_loss_vals
 
 
 def save_rollout_video(model_to_render, sim_info, mean, std, zero_norm, get_labels_fn, out_path, title_tag):
@@ -935,8 +913,17 @@ def main():
     def get_labels(batch_size):
         return task_label.expand(batch_size)
 
-    from conflictfree.momentum_operator import PseudoMomentumOperator
-    operator = PseudoMomentumOperator(num_vectors=max(1, len(ACTIVE_LOSSES)))
+    num_active_tasks = len(ACTIVE_LOSSES)
+    if num_active_tasks > 1:
+        init_lambdas = torch.tensor([TASK_IMPORTANCE[n] for n in ACTIVE_LOSSES], dtype=torch.float32, device=DEVICE)
+        init_lambdas = init_lambdas / init_lambdas.mean()
+        lambda_weights = nn.Parameter(init_lambdas)
+        optimizer_lambda = torch.optim.AdamW([lambda_weights], lr=0.005)
+    else:
+        lambda_weights = None
+        optimizer_lambda = None
+        
+    initial_loss_vals = None
     global_step = 0
 
     train_losses = {"mse": [], "grad": [], "direction": [], "combo": []}
@@ -978,7 +965,7 @@ def main():
             current_lr = optimizer.param_groups[0]["lr"]
             print(f"\nEpoch {epoch:02d}/{EPOCHS}  LR: {current_lr:.2e}")
 
-            train_loss = run_epoch(
+            train_loss, initial_loss_vals = run_epoch(
                 model=model,
                 loader=train_loader,
                 zero_norm=zero_norm,
@@ -986,15 +973,22 @@ def main():
                 loss_fn=loss_fn,
                 training=True,
                 optimizer=optimizer,
-                operator=operator,
                 global_step=global_step,
+                lambda_weights=lambda_weights,
+                optimizer_lambda=optimizer_lambda,
+                initial_loss_vals=initial_loss_vals,
             )
             global_step += len(train_loader)
+            
+            if lambda_weights is not None:
+                lw = lambda_weights.detach().cpu().numpy()
+                lam_dict = {name: round(float(val), 4) for name, val in zip(ACTIVE_LOSSES, lw)}
+                print(f"  GradNorm lambdas: {lam_dict}")
 
             if val_loader is None:
                 val_loss = {"mse": float("nan"), "grad": float("nan"), "direction": float("nan"), "combo": float("nan")}
             else:
-                val_loss = run_epoch(
+                val_loss, _ = run_epoch(
                     model=model,
                     loader=val_loader,
                     zero_norm=zero_norm,
@@ -1162,3 +1156,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nInterrupted by user. Exiting.")
         sys.exit(130)
+
+

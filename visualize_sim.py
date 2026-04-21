@@ -35,16 +35,24 @@ N_WORKERS  = max(1, cpu_count() - 1)   # parallel workers
 # ─── File list – drop first 20 % ─────────────────────────────────────────────
 vel_files = sorted(glob.glob(os.path.join(SIM_DIR, "velocity_*.npz")))
 pre_files = sorted(glob.glob(os.path.join(SIM_DIR, "pressure_*.npz")))
+den_files = sorted(glob.glob(os.path.join(SIM_DIR, "density_*.npz")))
+if not den_files:
+    den_files = sorted(glob.glob(os.path.join(SIM_DIR, "rho_*.npz")))
 assert len(vel_files) == len(pre_files)
+if den_files:
+    assert len(vel_files) == len(den_files)
 
 start = int(len(vel_files) * SKIP_FRAC)
 vel_files = vel_files[start:]
 pre_files = pre_files[start:]
+if den_files:
+    den_files = den_files[start:]
 n_frames  = len(vel_files)
 print(f"Total frames available: {len(vel_files)+start}  →  using last {n_frames} "
       f"(skipping first {start} = {SKIP_FRAC*100:.0f}%)")
 print(f"Video duration: {n_frames/FPS:.1f} s at {FPS} fps")
 print(f"Using {N_WORKERS} worker processes out of {cpu_count()} CPUs")
+print(f"Density channel: {'enabled' if len(den_files) > 0 else 'not found'}")
 
 # ─── Obstacle mask ─────────────────────────────────────────────────────────────
 obs_path  = os.path.join(SIM_DIR, "obstacle_mask.npz")
@@ -66,6 +74,7 @@ print(f"Scanning {min(80, n_frames)} frames for full-range limits …")
 sample_idx = np.linspace(0, n_frames - 1, min(80, n_frames), dtype=int)
 vel_mags   = []
 pres_vals  = []
+den_vals   = []
 
 for i in sample_idx:
     vel  = np.load(vel_files[i])["arr_0"]
@@ -73,6 +82,9 @@ for i in sample_idx:
     mag  = np.sqrt(vel[0]**2 + vel[1]**2)
     vel_mags.append(mag)
     pres_vals.append(pres[0])
+    if den_files:
+        den = np.load(den_files[i])["arr_0"]
+        den_vals.append(den[0])
 
 vel_vmax  = np.percentile(np.concatenate([m.ravel() for m in vel_mags]), PCTILE)
 pres_flat = np.concatenate([p.ravel() for p in pres_vals])
@@ -80,43 +92,61 @@ pres_abs  = np.percentile(np.abs(pres_flat), PCTILE)
 
 print(f"  |u| vmax  (full range): {vel_vmax:.4f}")
 print(f"  |p| abs   (full range): {pres_abs:.5f}")
+if den_vals:
+    den_flat = np.concatenate([d.ravel() for d in den_vals])
+    den_min = float(np.percentile(den_flat, 0))
+    den_max = float(np.percentile(den_flat, PCTILE))
+    print(f"  rho range (full range): [{den_min:.5f}, {den_max:.5f}]")
+else:
+    den_min, den_max = None, None
 
 # ─── Build a small figure template once (shared state via module globals) ─────
 FIG_W, FIG_H = 13, 4.2    # inches
 
-def _make_fig():
-    """Create the figure layout; return fig, ax_vel, ax_pres."""
+def _make_fig(has_density):
+    """Create the figure layout; return fig and axes."""
     fig = plt.figure(figsize=(FIG_W, FIG_H), facecolor="#111111")
-    gs  = gridspec.GridSpec(1, 2, figure=fig,
-                            left=0.05, right=0.95, top=0.86, bottom=0.18,
-                            wspace=0.10)
-    ax_vel  = fig.add_subplot(gs[0])
-    ax_pres = fig.add_subplot(gs[1])
-    for ax in (ax_vel, ax_pres):
+    if has_density:
+        gs = gridspec.GridSpec(1, 3, figure=fig,
+                               left=0.04, right=0.96, top=0.86, bottom=0.18,
+                               wspace=0.10)
+        axes = [fig.add_subplot(gs[0]), fig.add_subplot(gs[1]), fig.add_subplot(gs[2])]
+    else:
+        gs = gridspec.GridSpec(1, 2, figure=fig,
+                               left=0.05, right=0.95, top=0.86, bottom=0.18,
+                               wspace=0.10)
+        axes = [fig.add_subplot(gs[0]), fig.add_subplot(gs[1])]
+    for ax in axes:
         ax.set_facecolor("#111111")
         ax.tick_params(colors="#cccccc", labelsize=8)
         for sp in ax.spines.values():
             sp.set_edgecolor("#444444")
         ax.set_xlabel("x", color="#aaaaaa", fontsize=8)
         ax.set_ylabel("y", color="#aaaaaa", fontsize=8)
-    return fig, ax_vel, ax_pres
+    return fig, axes
 
 
 # ─── Worker: render one frame → raw RGBA bytes ────────────────────────────────
 # All heavy imports happen in the worker process; state is passed via args.
 
 def render_frame(args):
-    idx, vf, pf, vel_vmax, pres_abs, obs_rgba, dt_per_frame, start, n_frames = args
+    idx, vf, pf, df, vel_vmax, pres_abs, den_min, den_max, obs_rgba, dt_per_frame, start, n_frames = args
 
     vel  = np.load(vf)["arr_0"]    # (2, x, y)
     pres = np.load(pf)["arr_0"]    # (1, x, y)
+    has_density = df is not None
     mag  = np.rot90(np.sqrt(vel[0]**2 + vel[1]**2), k=1)
     p    = np.rot90(pres[0], k=1)
+    if has_density:
+        den = np.load(df)["arr_0"]
+        rho = np.rot90(den[0], k=1)
 
-    fig, ax_vel, ax_pres = _make_fig()
+    fig, axes = _make_fig(has_density)
+    ax_vel, ax_pres = axes[0], axes[1]
 
     norm_vel  = Normalize(vmin=0,         vmax=vel_vmax)
     norm_pres = Normalize(vmin=-pres_abs, vmax=pres_abs)
+    norm_den = Normalize(vmin=den_min, vmax=den_max) if has_density else None
 
     im_v = ax_vel.imshow(mag, origin="lower", aspect="auto",
                          cmap="viridis",  norm=norm_vel,  interpolation="bilinear")
@@ -126,6 +156,12 @@ def render_frame(args):
     if obs_rgba is not None:
         ax_vel.imshow(obs_rgba,  origin="lower", aspect="auto", interpolation="nearest")
         ax_pres.imshow(obs_rgba, origin="lower", aspect="auto", interpolation="nearest")
+    if has_density:
+        ax_den = axes[2]
+        im_d = ax_den.imshow(rho, origin="lower", aspect="auto",
+                             cmap="magma", norm=norm_den, interpolation="bilinear")
+        if obs_rgba is not None:
+            ax_den.imshow(obs_rgba, origin="lower", aspect="auto", interpolation="nearest")
 
     for ax, im, label, fmt in [
         (ax_vel,  im_v, "Velocity Magnitude  |u| (m/s)", "%.2f"),
@@ -134,6 +170,11 @@ def render_frame(args):
         ax.set_title(label, color="white", fontsize=11, pad=5, fontweight="bold")
         cb = fig.colorbar(im, ax=ax, orientation="horizontal",
                           pad=0.14, fraction=0.05, format=fmt)
+        cb.ax.tick_params(colors="#cccccc", labelsize=7)
+        cb.outline.set_edgecolor("#555555")
+    if has_density:
+        ax_den.set_title("Density  rho", color="white", fontsize=11, pad=5, fontweight="bold")
+        cb = fig.colorbar(im_d, ax=ax_den, orientation="horizontal", pad=0.14, fraction=0.05, format="%.3f")
         cb.ax.tick_params(colors="#cccccc", labelsize=7)
         cb.outline.set_edgecolor("#555555")
 
@@ -157,7 +198,8 @@ def render_frame(args):
 # Render frame 0 once to get w×h
 print("Probing frame size …")
 _test = render_frame((0, vel_files[0], pre_files[0],
-                      vel_vmax, pres_abs, OBS_RGBA,
+                      den_files[0] if den_files else None,
+                      vel_vmax, pres_abs, den_min, den_max, OBS_RGBA,
                       0.05, start, n_frames))
 # RGBA → each pixel = 4 bytes
 _npx   = len(_test) // 4
@@ -167,7 +209,7 @@ _w_px  = _npx // _h_px
 _probe = np.frombuffer(_test, dtype=np.uint8).reshape(-1, 4)
 _total_px = len(_probe)
 # Use matplotlib to get exact figure size in pixels
-_fig_tmp, _, _ = _make_fig()
+_fig_tmp, _ = _make_fig(len(den_files) > 0)
 _canvas = _fig_tmp.canvas
 _canvas.draw()
 _w_px, _h_px = _fig_tmp.canvas.get_width_height()
@@ -203,7 +245,20 @@ ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
 # ─── Build argument list ──────────────────────────────────────────────────────
 args_list = [
-    (i, vel_files[i], pre_files[i], vel_vmax, pres_abs, OBS_RGBA, 0.05, start, n_frames)
+    (
+        i,
+        vel_files[i],
+        pre_files[i],
+        den_files[i] if den_files else None,
+        vel_vmax,
+        pres_abs,
+        den_min,
+        den_max,
+        OBS_RGBA,
+        0.05,
+        start,
+        n_frames,
+    )
     for i in range(n_frames)
 ]
 
