@@ -13,7 +13,7 @@ Key design decisions:
   - Truncated Pushforward: Instead of just backpropagating through a single 
     failed step, we backpropagate through a sliding window of previous steps 
     (BPTT_WINDOW) to teach the model how to prevent the error from compounding.
-    - Deterministic EVT threshold (VEL_EPSILON) is calibrated from median
+    - Deterministic EVT threshold (VEL_EPSILON) is calibrated from mean
         rollout velocity statistics; VEL_STD is retained for monitoring only.
   - LoRA (r=16, alpha=16) is injected into qkv, to_qkv, fc1, fc2 via PEFT.
 """
@@ -54,11 +54,8 @@ MAX_ROLLOUT_LEN = 12
 BPTT_WINDOW = 3        # Number of steps to backpropagate through (Truncated Pushforward)
 
 # Thresholds are set automatically by calibrate_velocity_threshold()
-VEL_EPSILON   = None   # deterministic EVT threshold (EMA-smoothed median velocity)
+VEL_EPSILON   = None   # deterministic EVT threshold (mean velocity)
 VEL_STD       = None   # diagnostic velocity spread (not used for threshold sampling)
-
-# EMA smoothing factor for calibration updates across epochs.
-CALIB_EMA_ALPHA = 0.8
 
 if os.name != "nt":
     os.environ["LD_LIBRARY_PATH"] = (
@@ -637,10 +634,9 @@ def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn):
         v_t = E_t - E_{t-1}
 
     We collect v_t for t in [calib_start_step, calib_end_step] across the first
-    20% of training batches, then set a deterministic threshold from the median.
+    20% of training batches, then set a deterministic threshold from the mean.
 
-    Across epochs, thresholds are smoothed with EMA:
-        new = alpha * old + (1 - alpha) * current
+    Each epoch uses the current calibration result.
     """
     global VEL_EPSILON, VEL_STD
 
@@ -711,16 +707,8 @@ def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn):
         current_v_eps = fallback_v_eps
         current_v_std = 0.5 * fallback_v_eps
     else:
+        current_v_eps = float(global_sum / global_count)
         current_v_std = float(np.sqrt(max((global_sum_sq / global_count) - ((global_sum / global_count) ** 2), 0.0)))
-
-        local_med = float(np.median(v_values)) if v_values else 0.0
-        med_t = torch.tensor(local_med, dtype=torch.float64, device=DEVICE)
-        if DDP_ENABLED:
-            gathered_meds = [torch.zeros(1, dtype=torch.float64, device=DEVICE) for _ in range(WORLD_SIZE)]
-            dist.all_gather(gathered_meds, med_t.view(1))
-            current_v_eps = float(np.median([float(t.item()) for t in gathered_meds]))
-        else:
-            current_v_eps = local_med
 
         if current_v_eps <= 0:
             fallback = np.array(v_values, dtype=np.float64)
@@ -729,17 +717,10 @@ def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn):
             if DDP_ENABLED:
                 dist.all_reduce(floor_t, op=dist.ReduceOp.MAX)
             current_v_eps = max(float(floor_t.item()), 1e-8)
-            print0("  NOTE: mean absolute velocity <= 0; using 75th-percentile as floor.")
+            print0("  NOTE: mean velocity <= 0; using 75th-percentile as floor.")
 
-    if VEL_EPSILON is None:
-        VEL_EPSILON = current_v_eps
-    else:
-        VEL_EPSILON = CALIB_EMA_ALPHA * float(VEL_EPSILON) + (1.0 - CALIB_EMA_ALPHA) * float(current_v_eps)
-
-    if VEL_STD is None:
-        VEL_STD = current_v_std
-    else:
-        VEL_STD = CALIB_EMA_ALPHA * float(VEL_STD) + (1.0 - CALIB_EMA_ALPHA) * float(current_v_std)
+    VEL_EPSILON = float(current_v_eps)
+    VEL_STD = float(current_v_std)
 
     print0(f"  Calibrated VEL_EPSILON   = {VEL_EPSILON:.6e}")
     print0(f"  Calibrated VEL_STD       = {VEL_STD:.6e}")
