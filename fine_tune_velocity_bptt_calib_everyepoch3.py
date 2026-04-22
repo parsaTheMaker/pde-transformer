@@ -789,12 +789,9 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
         # Keep stochastic controls identical across DDP ranks.
         rng_seed = 12345 + int(global_step)
         py_rng = random.Random(rng_seed)
-        if VEL_EPSILON is not None:
-            _vel_thresholds = [max(0.0, float(VEL_EPSILON))] * n_batches
-        else:
-            _vel_thresholds = [2e-5] * n_batches
+        vel_threshold = max(0.0, float(VEL_EPSILON)) if VEL_EPSILON is not None else 2e-5
     else:
-        _vel_thresholds = [2e-5] * n_batches
+        vel_threshold = 2e-5
 
     context = torch.enable_grad if training else torch.inference_mode
     with context():
@@ -807,7 +804,7 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
             max_rollout = min(MAX_ROLLOUT_LEN, y_seq.shape[1])
             max_rollout_seen = max(max_rollout_seen, max_rollout)
 
-            current_vel_threshold = _vel_thresholds[step]
+            current_vel_threshold = vel_threshold
 
             if mask.ndim == 3:   
                 mask = mask.unsqueeze(1)   
@@ -815,7 +812,8 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
             if training:
                 states_seq = []  
                 prev_err_per_sample = None
-                pos_vel_stats = []
+                pos_vel_sum = 0.0
+                pos_vel_count = 0
                 target_N = -1     
 
                 rand_val = py_rng.random()
@@ -850,7 +848,8 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                             vel_candidate_steps += 1
                             curr_vel, _ = positive_velocity_stat(mse_per_sample, prev_err_per_sample)
                             if curr_vel is not None:
-                                pos_vel_stats.append(curr_vel)
+                                pos_vel_sum += curr_vel
+                                pos_vel_count += 1
                                 if curr_vel > current_vel_threshold:
                                     target_N = t - 1
                                     break
@@ -915,7 +914,7 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
 
                 (loss_to_backprop / ACCUM_GRAD).backward()
 
-                if (step + 1) % ACCUM_GRAD == 0 or (step + 1) == len(loader):
+                if (step + 1) % ACCUM_GRAD == 0 or (step + 1) == n_batches:
                     torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -924,7 +923,7 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                     loss_accum["mse"] += loss_to_backprop.detach() * batch_size
                     loss_accum["N"] += target_N * batch_size
                     max_target_N = max(max_target_N, target_N)
-                    avg_v = sum(pos_vel_stats) / len(pos_vel_stats) if pos_vel_stats else 0.0
+                    avg_v = pos_vel_sum / pos_vel_count if pos_vel_count > 0 else 0.0
                     loss_accum["vel"] += avg_v * batch_size
                     sample_count += batch_size
 
@@ -941,19 +940,16 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                     mse_loss = F.mse_loss(pred_raw, y_t)
                     avg_mse_accum += mse_loss
                     
-                    mse_per_sample = F.mse_loss(pred_raw, y_t, reduction='none').mean(dim=[1, 2, 3])
+                    mse_per_sample = per_sample_mse(pred_raw, y_t)
                     batch_mses.append(mse_per_sample.cpu().numpy())
                     state = torch.lerp(zero_norm, pred_raw, mask)
                 
                 loss_accum["mse"] += (avg_mse_accum / max_rollout).detach() * batch_size
-                batch_mses_stacked = np.stack(
-                    [b.copy() if isinstance(b, np.ndarray) else b.cpu().numpy() for b in batch_mses],
-                    axis=1
-                )
+                batch_mses_stacked = np.stack(batch_mses, axis=1)
                 all_val_mses.append(batch_mses_stacked)
                 sample_count += batch_size
 
-            if step == 0 or (step + 1) % TQDM_UPDATE_EVERY == 0 or (step + 1) == len(loader):
+            if step == 0 or (step + 1) % TQDM_UPDATE_EVERY == 0 or (step + 1) == n_batches:
                 update_progress(progress_bar, loss_accum, sample_count)
 
     loss_tensor = torch.tensor(
