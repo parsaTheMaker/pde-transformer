@@ -862,19 +862,10 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
 
                 local_available_last = len(states_seq) - 1
 
-                if DDP_ENABLED:
-                    # Synchronize truncation depth across ranks to avoid
-                    # data-dependent control-flow divergence in DDP.
-                    local_target = target_N if target_N >= 0 else (max_rollout - 1)
-                    target_tensor = torch.tensor([local_target], dtype=torch.int64, device=DEVICE)
-                    available_tensor = torch.tensor([local_available_last], dtype=torch.int64, device=DEVICE)
-                    dist.all_reduce(target_tensor, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(available_tensor, op=dist.ReduceOp.MIN)
-                    avg_target = int(round(float(target_tensor.item()) / float(WORLD_SIZE)))
-                    target_N = min(avg_target, int(available_tensor.item()))
-                else:
-                    if target_N >= 0:
-                        target_N = min(target_N, local_available_last)
+                # Keep truncation decision local per rank so EVT semantics
+                # reflect the local positive-velocity statistic.
+                if target_N >= 0:
+                    target_N = min(target_N, local_available_last)
 
                 if target_N < 0:
                     target_N = -1
