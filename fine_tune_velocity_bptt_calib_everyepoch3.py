@@ -919,13 +919,15 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
+                # Include every processed training batch in reporting averages,
+                # including zero-loss fallback steps, to avoid optimistic bias.
+                loss_accum["mse"] += loss_to_backprop.detach() * batch_size
+                avg_v = pos_vel_sum / pos_vel_count if pos_vel_count > 0 else 0.0
+                loss_accum["vel"] += avg_v * batch_size
                 if target_N >= 0:
-                    loss_accum["mse"] += loss_to_backprop.detach() * batch_size
                     loss_accum["N"] += target_N * batch_size
                     max_target_N = max(max_target_N, target_N)
-                    avg_v = pos_vel_sum / pos_vel_count if pos_vel_count > 0 else 0.0
-                    loss_accum["vel"] += avg_v * batch_size
-                    sample_count += batch_size
+                sample_count += batch_size
 
             else:
                 state = x_batch.clone()
