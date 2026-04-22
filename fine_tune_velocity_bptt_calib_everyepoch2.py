@@ -13,8 +13,8 @@ Key design decisions:
   - Truncated Pushforward: Instead of just backpropagating through a single 
     failed step, we backpropagate through a sliding window of previous steps 
     (BPTT_WINDOW) to teach the model how to prevent the error from compounding.
-  - Tolerance (VEL_EPSILON) and per-sample noise std (VEL_STD) are calibrated
-    automatically every 4 epochs from a no-grad survey pass.
+    - Deterministic EVT threshold (VEL_EPSILON) is calibrated from median
+        rollout velocity statistics; VEL_STD is retained for monitoring only.
   - LoRA (r=16, alpha=16) is injected into qkv, to_qkv, fc1, fc2 via PEFT.
 """
 
@@ -54,8 +54,8 @@ MAX_ROLLOUT_LEN = 12
 BPTT_WINDOW = 3        # Number of steps to backpropagate through (Truncated Pushforward)
 
 # Thresholds are set automatically by calibrate_velocity_threshold()
-VEL_EPSILON   = None   # mean velocity at target step across train set
-VEL_STD       = None   # std velocity at target step across train set
+VEL_EPSILON   = None   # deterministic EVT threshold (EMA-smoothed median velocity)
+VEL_STD       = None   # diagnostic velocity spread (not used for threshold sampling)
 
 # EMA smoothing factor for calibration updates across epochs.
 CALIB_EMA_ALPHA = 0.8
