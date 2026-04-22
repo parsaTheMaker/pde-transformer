@@ -264,6 +264,12 @@ MODEL_TYPE = "PDE-S"
 USE_AMP = DEVICE == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 USE_CHANNELS_LAST = False
 NUM_WORKERS = max(0, cpu_count() - 5)
+# For DDP, default to zero worker processes per rank to minimize
+# dataloader process and IPC overhead. Override via env as needed.
+try:
+    DDP_LOADER_WORKERS = max(0, int(os.environ.get("DDP_LOADER_WORKERS", "0")))
+except ValueError:
+    DDP_LOADER_WORKERS = 0
 PIN_MEMORY = DEVICE == "cuda"
 CACHE_STATES_FILENAME = "states.float32.npy"
 CACHE_MASK_FILENAME = "obstacle_mask.float32.npy"
@@ -382,9 +388,9 @@ class MultiSimKarmanDataset(Dataset):
 
 def build_loader(dataset, shuffle, sampler=None):
     if DDP_ENABLED:
-        # Cap per-rank loader workers so torchrun does not spawn an excessive
-        # number of processes across all ranks.
-        per_rank_workers = max(0, min(NUM_WORKERS, max(1, cpu_count() // max(1, WORLD_SIZE)) - 1))
+        # Keep loader overhead minimal in DDP by default; this can be raised
+        # with DDP_LOADER_WORKERS for throughput tuning.
+        per_rank_workers = min(NUM_WORKERS, DDP_LOADER_WORKERS)
     else:
         per_rank_workers = NUM_WORKERS
 
@@ -399,6 +405,8 @@ def build_loader(dataset, shuffle, sampler=None):
     if per_rank_workers > 0:
         kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = PREFETCH_FACTOR
+        if os.name != "nt":
+            kwargs["multiprocessing_context"] = "fork"
     if PIN_MEMORY:
         kwargs["pin_memory_device"] = DEVICE
     return DataLoader(dataset, **kwargs)
