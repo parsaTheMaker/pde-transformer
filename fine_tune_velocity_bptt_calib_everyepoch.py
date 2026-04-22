@@ -1,5 +1,5 @@
 """
-fine_tune_velocity_bptt.py
+fine_tune_velocity_bptt_calib_everyepoch.py
 =====================
 Fine-tune the frozen PDE-Transformer base model using LoRA (via PEFT) on
 autoregressive multi-step rollout with Error-Velocity Truncation (EVT)
@@ -15,7 +15,7 @@ Key design decisions:
     (BPTT_WINDOW) to teach the model how to prevent the error from compounding.
   - Tolerance (VEL_EPSILON) and per-sample noise std (VEL_STD) are calibrated
     automatically every 4 epochs from a no-grad survey pass.
-  - LoRA (r=8, alpha=8) is injected into qkv, to_qkv, fc1, fc2 via PEFT.
+  - LoRA (r=16, alpha=16) is injected into qkv, to_qkv, fc1, fc2 via PEFT.
 """
 
 import os
@@ -164,32 +164,95 @@ def gather_val_mses(local_arr):
     if not DDP_ENABLED:
         return local_arr
 
-    if hasattr(dist, "gather_object"):
-        gathered = [None for _ in range(WORLD_SIZE)] if is_main_process() else None
-        dist.gather_object(local_arr, gathered, dst=0)
-        if not is_main_process():
-            return None
-        arrays = [a for a in gathered if isinstance(a, np.ndarray) and a.size > 0]
-        if not arrays:
-            return None
-        return np.concatenate(arrays, axis=0)
+    local_np = np.asarray(local_arr, dtype=np.float32)
+    if local_np.ndim != 2:
+        if local_np.size == 0:
+            local_np = np.empty((0, 0), dtype=np.float32)
+        else:
+            local_np = local_np.reshape(local_np.shape[0], -1)
 
-    gathered = [None for _ in range(WORLD_SIZE)]
-    dist.all_gather_object(gathered, local_arr)
-    arrays = [a for a in gathered if isinstance(a, np.ndarray) and a.size > 0]
+    local_rows, local_cols = local_np.shape
+    local_shape = torch.tensor([local_rows, local_cols], dtype=torch.int64, device=DEVICE)
+    gathered_shapes = [torch.zeros(2, dtype=torch.int64, device=DEVICE) for _ in range(WORLD_SIZE)]
+    dist.all_gather(gathered_shapes, local_shape)
+
+    rows_per_rank = [int(t[0].item()) for t in gathered_shapes]
+    cols_per_rank = [int(t[1].item()) for t in gathered_shapes]
+    max_rows = max(rows_per_rank) if rows_per_rank else 0
+    max_cols = max(cols_per_rank) if cols_per_rank else 0
+
+    padded_local = torch.zeros((max_rows, max_cols), dtype=torch.float32, device=DEVICE)
+    if local_rows > 0 and local_cols > 0:
+        local_tensor = torch.as_tensor(local_np, dtype=torch.float32, device=DEVICE)
+        padded_local[:local_rows, :local_cols] = local_tensor
+
+    gathered = [torch.empty_like(padded_local) for _ in range(WORLD_SIZE)]
+    dist.all_gather(gathered, padded_local)
+
+    if not is_main_process():
+        return None
+
+    arrays = []
+    for rank_tensor, rows, cols in zip(gathered, rows_per_rank, cols_per_rank):
+        if rows > 0 and cols > 0:
+            arrays.append(rank_tensor[:rows, :cols].cpu().numpy())
+
     if not arrays:
         return None
+
+    target_cols = max(a.shape[1] for a in arrays)
+    if any(a.shape[1] != target_cols for a in arrays):
+        aligned = []
+        for arr in arrays:
+            if arr.shape[1] == target_cols:
+                aligned.append(arr)
+            else:
+                padded = np.full((arr.shape[0], target_cols), np.nan, dtype=np.float32)
+                padded[:, :arr.shape[1]] = arr
+                aligned.append(padded)
+        arrays = aligned
+
     return np.concatenate(arrays, axis=0)
+
+
+def gather_triggered_ns(local_list):
+    if not DDP_ENABLED:
+        return local_list
+
+    local_np = np.asarray(local_list, dtype=np.int64)
+    local_len = int(local_np.size)
+
+    len_tensor = torch.tensor([local_len], dtype=torch.int64, device=DEVICE)
+    gathered_lens_t = [torch.zeros(1, dtype=torch.int64, device=DEVICE) for _ in range(WORLD_SIZE)]
+    dist.all_gather(gathered_lens_t, len_tensor)
+    lengths = [int(t.item()) for t in gathered_lens_t]
+    max_len = max(lengths) if lengths else 0
+
+    padded_local = torch.zeros((max_len,), dtype=torch.int64, device=DEVICE)
+    if local_len > 0:
+        padded_local[:local_len] = torch.as_tensor(local_np, dtype=torch.int64, device=DEVICE)
+
+    gathered = [torch.empty_like(padded_local) for _ in range(WORLD_SIZE)]
+    dist.all_gather(gathered, padded_local)
+
+    if not is_main_process():
+        return None
+
+    merged = []
+    for rank_tensor, rank_len in zip(gathered, lengths):
+        if rank_len > 0:
+            merged.extend(rank_tensor[:rank_len].cpu().tolist())
+    return merged
 
 # ---------------------------------------------------------------------------
 # User-editable configuration
 # ---------------------------------------------------------------------------
 SIM_ROOT = "./data/256_inc"
-OUT_DIR = os.path.join("runs", "karman_finetuned_velocity_LoRA_bptt")
+OUT_DIR = os.path.join("runs", "karman_finetuned_velocity_LoRA_bptt_calib_everyepoch")
 EPOCHS = 40
 BATCH_SIZE = 12
 ACCUM_GRAD = 1
-LR = 4e-5
+LR = 1e-4
 VAL_FRAC = 0.1
 WARMUP_FRAC = 0.5
 from sim_cache import discover_simulations, ensure_all_sim_caches, load_packed_array
@@ -210,6 +273,8 @@ CACHE_MASK_FILENAME = "obstacle_mask.float32.npy"
 CACHE_WORKERS = max(1, cpu_count() - 5)
 PREFETCH_FACTOR = 2
 TQDM_UPDATE_EVERY = 20
+DDP_BUCKET_CAP_MB = 100
+DDP_USE_STATIC_GRAPH = False
 
 
 # ---------------------------------------------------------------------------
@@ -439,8 +504,8 @@ def get_model():
         base_model = base_model.to(memory_format=torch.channels_last)
 
     lora_config = LoraConfig(
-        r=8,
-        lora_alpha=8,
+        r=16,
+        lora_alpha=16,
         target_modules=["qkv", "to_qkv", "fc1", "fc2"],
         lora_dropout=0.05,
         bias="none",
@@ -473,14 +538,16 @@ def create_optimizer(model):
 # Device helpers
 # ---------------------------------------------------------------------------
 def move_batch_to_device(x, y_seq, mask):
-    if DEVICE != "cuda":
+    if x.device.type != DEVICE:
         x = x.to(DEVICE, non_blocking=PIN_MEMORY)
+    if y_seq.device.type != DEVICE:
         y_seq = y_seq.to(DEVICE, non_blocking=PIN_MEMORY)
+    if mask.device.type != DEVICE:
         mask = mask.to(DEVICE, non_blocking=PIN_MEMORY)
-        if USE_CHANNELS_LAST:
-            x = x.contiguous(memory_format=torch.channels_last)
-            y_seq = y_seq.contiguous(memory_format=torch.channels_last)
-            mask = mask.contiguous(memory_format=torch.channels_last)
+    if USE_CHANNELS_LAST:
+        x = x.contiguous(memory_format=torch.channels_last)
+        y_seq = y_seq.contiguous(memory_format=torch.channels_last)
+        mask = mask.contiguous(memory_format=torch.channels_last)
     return x, y_seq, mask
 
 
@@ -691,6 +758,7 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
     }
     sample_count = 0
     all_val_mses = [] if not training else None
+    triggered_ns = [] if training else None
     max_rollout_seen = 0
     max_target_N = -1
 
@@ -734,12 +802,8 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                 target_N = -1     
 
                 rand_val = py_rng.random()
-                if rand_val < 0.15:
+                if rand_val < 0.25:
                     fixed_target = 0
-                elif rand_val < 0.25:
-                    fixed_target = 1
-                elif rand_val < 0.35:
-                    fixed_target = 2
                 else:
                     fixed_target = -1
 
@@ -775,13 +839,26 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
 
                         state = torch.lerp(zero_norm, pred_dry, mask)
 
+                local_available_last = len(states_seq) - 1
+
                 if DDP_ENABLED:
                     # Synchronize truncation depth across ranks to avoid
                     # data-dependent control-flow divergence in DDP.
                     local_target = target_N if target_N >= 0 else (max_rollout - 1)
                     target_tensor = torch.tensor([local_target], dtype=torch.int64, device=DEVICE)
+                    available_tensor = torch.tensor([local_available_last], dtype=torch.int64, device=DEVICE)
                     dist.all_reduce(target_tensor, op=dist.ReduceOp.MIN)
-                    target_N = int(target_tensor.item())
+                    dist.all_reduce(available_tensor, op=dist.ReduceOp.MIN)
+                    target_N = min(int(target_tensor.item()), int(available_tensor.item()))
+                else:
+                    if target_N >= 0:
+                        target_N = min(target_N, local_available_last)
+
+                if target_N < 0:
+                    target_N = -1
+
+                if triggered_ns is not None:
+                    triggered_ns.append(int(target_N))
 
                 # --- Phase 2: Sliding Window Pushforward with Grad ---
                 loss_to_backprop = None
@@ -792,7 +869,8 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                     
                     # Grab the clean, detached input state from Phase 1
                     current_state = states_seq[window_start].detach()
-                    window_loss = 0.0
+                    window_loss = torch.zeros((), device=DEVICE)
+                    weight_sum = 0.0
                     
                     for t in range(window_start, target_N + 1):
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
@@ -804,13 +882,14 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                         
                         step_loss = F.mse_loss(pred_raw, y_seq[:, t])
                         window_loss += step_loss * weight
+                        weight_sum += weight
                         
                         # If this isn't the last step in the window, advance the state differentiably
                         if t < target_N:
                             current_state = torch.lerp(zero_norm, pred_raw, mask)
                             
                     # Average the accumulated loss over the window size
-                    loss_to_backprop = window_loss / (target_N - window_start + 1)
+                    loss_to_backprop = window_loss / max(weight_sum, 1e-12)
 
                 if loss_to_backprop is None:
                     # Keep DDP ranks synchronized: even if EVT finds no valid
@@ -900,12 +979,15 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
     else:
         gathered_val = None
 
+    gathered_triggered_ns = gather_triggered_ns(triggered_ns) if training else None
+
     return {
         "mse": total_mse / denom,
         "N": total_N / denom if training else 0.0,
         "vel": total_vel / denom if training else 0.0,
         "max_N": max_N_reached if training else max_rollout_seen - 1,
         "all_val_mses": gathered_val if (not training and is_main_process()) else None,
+        "triggered_ns": gathered_triggered_ns if (training and is_main_process()) else None,
     }
 
 
@@ -986,6 +1068,60 @@ def analyze_and_plot(all_mses, out_dir, epoch, log_path=None):
     plt.close()
     
     print(f"\nPlots saved successfully to: {plot_path}")
+
+
+def plot_triggered_n_distribution(triggered_ns, out_dir, epoch, log_path=None):
+    os.makedirs(out_dir, exist_ok=True)
+
+    values = np.asarray(triggered_ns, dtype=np.int64)
+    max_bin = MAX_ROLLOUT_LEN - 1
+    if values.size > 0:
+        max_bin = max(max_bin, int(values.max()))
+
+    counts = np.bincount(values, minlength=max_bin + 1) if values.size > 0 else np.zeros(max_bin + 1, dtype=np.int64)
+    steps = np.arange(counts.shape[0])
+
+    summary_lines = [
+        "",
+        f"--- Epoch {epoch} Triggered N Distribution ---",
+        f"Total batches: {int(values.size)}",
+    ]
+    for step, count in zip(steps, counts):
+        summary_lines.append(f"N={step:02d}: {int(count)}")
+    summary_str = "\n".join(summary_lines)
+    print(summary_str)
+
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(summary_str + "\n\n")
+
+    fig, ax = plt.subplots(1, 1, figsize=(9, 5), facecolor="#111")
+    ax.set_facecolor("#111")
+    ax.bar(steps, counts, color="#7bdff2", edgecolor="#d6f6ff", linewidth=0.8)
+    ax.set_title("Triggered N Distribution per Epoch", color="white", fontsize=12)
+    ax.set_xlabel("Triggered rollout step N", color="white")
+    ax.set_ylabel("Batch count", color="white")
+    ax.set_xticks(steps)
+    ax.tick_params(colors="white")
+    ax.text(
+        0.5,
+        0.98,
+        "Includes fixed_target=0 batches",
+        transform=ax.transAxes,
+        ha="center",
+        va="top",
+        color="#cccccc",
+        fontsize=9,
+    )
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#555")
+
+    plt.tight_layout()
+    plot_path = os.path.join(out_dir, f"triggered_n_distribution_epoch_{epoch:03d}.png")
+    plt.savefig(plot_path, dpi=150, facecolor="#111")
+    plt.close()
+
+    print(f"  Saved: {plot_path}")
 
 def save_rollout_video(model_to_render, sim_info, mean, std, zero_norm, get_labels_fn, out_path, title_tag):
     video_states = load_packed_array(sim_info["states_path"])
@@ -1173,12 +1309,28 @@ def main():
     print0(f"  Total parameters : {n_params:.2e} M")
     print0(f"  Trainable params : {n_trainable:.2e} M  (LoRA adapters only)")
     if DDP_ENABLED:
-        model = DDP(
-            model,
-            device_ids=[LOCAL_RANK] if DEVICE == "cuda" else None,
-            output_device=LOCAL_RANK if DEVICE == "cuda" else None,
-            find_unused_parameters=False,
-        )
+        ddp_kwargs = {
+            "device_ids": [LOCAL_RANK] if DEVICE == "cuda" else None,
+            "output_device": LOCAL_RANK if DEVICE == "cuda" else None,
+            "find_unused_parameters": False,
+        }
+        try:
+            model = DDP(
+                model,
+                static_graph=DDP_USE_STATIC_GRAPH,
+                gradient_as_bucket_view=True,
+                broadcast_buffers=False,
+                bucket_cap_mb=DDP_BUCKET_CAP_MB,
+                **ddp_kwargs,
+            )
+            print0(
+                f"  DDP fast-path: static_graph={DDP_USE_STATIC_GRAPH}, "
+                "gradient_as_bucket_view=True, broadcast_buffers=False, "
+                f"bucket_cap_mb={DDP_BUCKET_CAP_MB}"
+            )
+        except TypeError:
+            model = DDP(model, **ddp_kwargs)
+            print0("  DDP fast-path flags unavailable; using baseline DDP arguments.")
     if DEVICE == "cuda":
         print0("  Device prefetch: enabled")
 
@@ -1244,21 +1396,20 @@ def main():
             if val_sampler is not None:
                 val_sampler.set_epoch(epoch)
             
-            # Calibrate every 4 epochs (1, 5, 9, etc.) or if the threshold is missing (e.g. freshly loaded model)
-            if (epoch - 1) % 4 == 0 or VEL_EPSILON is None:
-                calibrate_velocity_threshold(model, train_loader, zero_norm, get_labels)
+            # Calibrate before every epoch so EVT thresholds track the model as it changes.
+            calibrate_velocity_threshold(model, train_loader, zero_norm, get_labels)
 
-                print0("\nPost-calibration warm-up (de-tainting inference tensors) ...")
-                model.train()   
-                with torch.enable_grad():
-                    _dummy_in = torch.zeros(1, 3, 256, 256, device=DEVICE, requires_grad=False)
-                    _dummy_out = model(_dummy_in, class_labels=get_labels(1)).sample
-                    _dummy_out.sum().backward()
-                    del _dummy_in, _dummy_out
-                optimizer.zero_grad(set_to_none=True)
-                if DEVICE == "cuda":
-                    torch.cuda.empty_cache()
-                print0("  Done.")
+            print0("\nPost-calibration warm-up (de-tainting inference tensors) ...")
+            model.train()
+            with torch.enable_grad():
+                _dummy_in = torch.zeros(1, 3, 256, 256, device=DEVICE, requires_grad=False)
+                _dummy_out = model(_dummy_in, class_labels=get_labels(1)).sample
+                _dummy_out.sum().backward()
+                del _dummy_in, _dummy_out
+            optimizer.zero_grad(set_to_none=True)
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
+            print0("  Done.")
 
             if DDP_ENABLED:
                 ddp_barrier()
@@ -1290,6 +1441,9 @@ def main():
                 if is_main_process() and val_loss["all_val_mses"] is not None:
                     # Pass the loss_log_path to write the table to it
                     analyze_and_plot(val_loss["all_val_mses"], OUT_DIR, epoch, log_path=loss_log_path)
+
+            if is_main_process() and train_loss.get("triggered_ns") is not None:
+                plot_triggered_n_distribution(train_loss["triggered_ns"], OUT_DIR, epoch, log_path=loss_log_path)
 
             scheduler.step()
             train_losses["mse"].append(train_loss["mse"])
