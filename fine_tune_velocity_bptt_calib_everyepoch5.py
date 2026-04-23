@@ -615,6 +615,14 @@ def positive_log_growth_stat(curr_err_per_sample, prev_err_per_sample, eps=EVT_S
     return float(pos_score.mean().item()), int(pos_score.numel())
 
 
+def ema_update(prev_value, current_value, decay):
+    """EMA update with pure initialization.
+
+    If there is no previous value, return the current value directly.
+    """
+    return current_value if prev_value is None else (decay * prev_value + (1.0 - decay) * current_value)
+
+
 def save_checkpoint(model, optimizer, scheduler, epoch, best_metric, train_losses, val_losses):
     checkpoint = build_checkpoint(model, optimizer, scheduler, epoch, best_metric, train_losses, val_losses)
     torch.save(checkpoint, os.path.join(OUT_DIR, "last.ckpt"))
@@ -746,10 +754,7 @@ def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn):
         raw_evt_eps = float(global_sum / global_count)
         raw_evt_std = float(np.sqrt(max((global_sum_sq / global_count) - ((global_sum / global_count) ** 2), 0.0)))
 
-        if VEL_EPSILON is None:
-            VEL_EPSILON = raw_evt_eps
-        else:
-            VEL_EPSILON = EVT_EMA_DECAY * VEL_EPSILON + (1.0 - EVT_EMA_DECAY) * raw_evt_eps
+        VEL_EPSILON = ema_update(VEL_EPSILON, raw_evt_eps, EVT_EMA_DECAY)
         VEL_STD = raw_evt_std
 
     if VEL_STD is None:
@@ -877,14 +882,7 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
 
                             raw_batch_score = 0.0 if curr_score is None else curr_score
                             prev_ema = ema_trigger_scores[t]
-                            ema_score = (
-                                raw_batch_score
-                                if prev_ema is None
-                                else (
-                                    TRIGGER_SCORE_EMA_DECAY * prev_ema
-                                    + (1.0 - TRIGGER_SCORE_EMA_DECAY) * raw_batch_score
-                                )
-                            )
+                            ema_score = ema_update(prev_ema, raw_batch_score, TRIGGER_SCORE_EMA_DECAY)
                             ema_trigger_scores[t] = ema_score
 
                             if curr_score is not None:
