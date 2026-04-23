@@ -557,16 +557,27 @@ def move_batch_to_device(x, y_seq, mask):
     return x, y_seq, mask
 
 
-def update_progress(progress_bar, loss_dict, sample_count):
-    denom = max(1, sample_count)
-    avg = {}
-    for key, value in loss_dict.items():
-        v = value / denom
-        avg[key] = v.detach().item() if isinstance(v, torch.Tensor) else float(v)
+def update_progress(progress_bar, loss_dict, sample_count, n_count=0, trigger_vel_sum=0.0, trigger_vel_count=0):
+    mse_denom = max(1, sample_count)
+    mse_avg = loss_dict["mse"] / mse_denom
+    mse_avg = mse_avg.detach().item() if isinstance(mse_avg, torch.Tensor) else float(mse_avg)
+
+    if n_count > 0:
+        n_avg = float(loss_dict["N"]) / float(n_count)
+        n_str = f"{n_avg:.2e}"
+    else:
+        n_str = "N/A"
+
+    if trigger_vel_count > 0:
+        vel_avg = float(trigger_vel_sum) / float(trigger_vel_count)
+        vel_str = f"{vel_avg:.6e}"
+    else:
+        vel_str = "N/A"
+
     progress_bar.set_postfix(
-        mse=f"{avg['mse']:.6e}",
-        N=f"{avg.get('N', 0):.2e}",
-        vel=f"{avg.get('vel', 0):.6e}",
+        mse=f"{mse_avg:.6e}",
+        N=n_str,
+        vel=vel_str,
     )
 
 
@@ -647,7 +658,7 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
 # ---------------------------------------------------------------------------
 # Calibration
 # ---------------------------------------------------------------------------
-def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn):
+def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn, epoch=None, log_path=None):
     """Survey a fraction of the train loader *once* with no gradients to collect
     first-differences of MSE errors for every rollout velocity step.
 
@@ -752,7 +763,8 @@ def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn):
     std_by_step[0] = 0.0
 
     print0("  Per-step EVT calibration (index 0 unused):")
-    print0(f"    {'step':>4} {'count':>8} {'mean':>12} {'std':>12}")
+    print0(f"    {'step':>4} {'count':>8} {'mean':>12} {'std':>12} {'source':>10}")
+    table_rows = []
     for t in range(1, MAX_ROLLOUT_LEN):
         c = float(global_count[t])
         count_by_step[t] = int(c)
@@ -760,17 +772,39 @@ def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn):
             mean_t = float(global_sum[t] / c)
             var_t = float(global_sum_sq[t] / c - mean_t * mean_t)
             std_t = float(np.sqrt(max(var_t, 0.0)))
+            source_t = "observed"
         else:
             mean_t = fallback_mean
             std_t = fallback_std
+            source_t = "fallback"
 
         eps_by_step[t] = float(mean_t)
         std_by_step[t] = float(std_t)
-        print0(f"    {t:>4d} {int(c):>8d} {mean_t:>12.6e} {std_t:>12.6e}")
+        print0(f"    {t:>4d} {int(c):>8d} {mean_t:>12.6e} {std_t:>12.6e} {source_t:>10}")
+        table_rows.append((
+            int(epoch) if epoch is not None else -1,
+            t,
+            int(c),
+            float(mean_t),
+            float(std_t),
+            source_t,
+        ))
 
     VEL_EPSILON_BY_STEP = eps_by_step
     VEL_STD_BY_STEP = std_by_step
     VEL_COUNT_BY_STEP = count_by_step
+
+    if is_main_process() and log_path:
+        with open(log_path, "a", encoding="utf-8") as f:
+            epoch_label = int(epoch) if epoch is not None else -1
+            f.write(f"--- Epoch {epoch_label} Per-step EVT Calibration ---\n")
+            f.write("epoch step count vel_epsilon vel_std source\n")
+            for row in table_rows:
+                f.write(
+                    f"{row[0]} {row[1]} {row[2]} "
+                    f"{row[3]:.6e} {row[4]:.6e} {row[5]}\n"
+                )
+            f.write("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -803,10 +837,12 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
 
     loss_accum = {
         "mse":   torch.zeros((), device=DEVICE),
-        "N":     0,     
-        "vel":   0.0,   
+        "N":     0.0,
     }
     sample_count = 0
+    n_count = 0
+    trigger_vel_sum = 0.0
+    trigger_vel_count = 0
     all_val_mses = [] if not training else None
     triggered_ns = [] if training else None
     max_rollout_seen = 0
@@ -850,8 +886,7 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
             if training:
                 states_seq = []  
                 prev_err_per_sample = None
-                pos_vel_sum = 0.0
-                pos_vel_count = 0
+                triggered_vel = None
                 target_N = -1     
 
                 rand_val = py_rng.random()
@@ -886,10 +921,9 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                             vel_candidate_steps += 1
                             curr_vel, _ = positive_velocity_stat(mse_per_sample, prev_err_per_sample)
                             if curr_vel is not None:
-                                pos_vel_sum += curr_vel
-                                pos_vel_count += 1
                                 threshold_t = float(vel_threshold_by_step[t])
                                 if curr_vel > threshold_t:
+                                    triggered_vel = float(curr_vel)
                                     target_N = t - 1
                                     break
                             else:
@@ -961,11 +995,13 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                 # Include every processed training batch in reporting averages,
                 # including zero-loss fallback steps, to avoid optimistic bias.
                 loss_accum["mse"] += loss_to_backprop.detach() * batch_size
-                avg_v = pos_vel_sum / pos_vel_count if pos_vel_count > 0 else 0.0
-                loss_accum["vel"] += avg_v * batch_size
                 if target_N >= 0:
                     loss_accum["N"] += target_N * batch_size
+                    n_count += batch_size
                     max_target_N = max(max_target_N, target_N)
+                if triggered_vel is not None:
+                    trigger_vel_sum += float(triggered_vel)
+                    trigger_vel_count += 1
                 sample_count += batch_size
 
             else:
@@ -991,14 +1027,23 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                 sample_count += batch_size
 
             if step == 0 or (step + 1) % TQDM_UPDATE_EVERY == 0 or (step + 1) == n_batches:
-                update_progress(progress_bar, loss_accum, sample_count)
+                update_progress(
+                    progress_bar,
+                    loss_accum,
+                    sample_count,
+                    n_count=n_count,
+                    trigger_vel_sum=trigger_vel_sum,
+                    trigger_vel_count=trigger_vel_count,
+                )
 
     loss_tensor = torch.tensor(
         [
             float(loss_accum["mse"].detach().item()),
             float(loss_accum["N"]),
-            float(loss_accum["vel"]),
+            float(n_count),
             float(sample_count),
+            float(trigger_vel_sum),
+            float(trigger_vel_count),
         ],
         device=DEVICE,
         dtype=torch.float64,
@@ -1018,11 +1063,17 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
     if DDP_ENABLED:
         dist.all_reduce(vel_stat_tensor, op=dist.ReduceOp.SUM)
 
-    total_mse, total_N, total_vel, total_samples = loss_tensor.tolist()
+    total_mse, total_N, total_n_count, total_samples, total_trigger_vel_sum, total_trigger_vel_count = loss_tensor.tolist()
     total_missing_pos_steps, total_candidate_steps = vel_stat_tensor.tolist()
     denom = max(1.0, total_samples)
     max_N_reached = int(max_target_tensor.item())
     pos_vel_none_pct = (100.0 * total_missing_pos_steps / total_candidate_steps) if total_candidate_steps > 0 else 0.0
+    avg_rollout_n = (total_N / max(1.0, total_n_count)) if training else 0.0
+    epoch_trigger_vel = (
+        (total_trigger_vel_sum / total_trigger_vel_count)
+        if (training and total_trigger_vel_count > 0)
+        else float("nan")
+    )
 
     if not training:
         local_val = (
@@ -1038,8 +1089,9 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
 
     return {
         "mse": total_mse / denom,
-        "N": total_N / denom if training else 0.0,
-        "vel": total_vel / denom if training else 0.0,
+        "N": avg_rollout_n,
+        "trigger_vel": epoch_trigger_vel,
+        "trigger_vel_count": int(total_trigger_vel_count) if training else 0,
         "max_N": max_N_reached if training else max_rollout_seen - 1,
         "pos_vel_none_pct": pos_vel_none_pct if training else 0.0,
         "all_val_mses": gathered_val if (not training and is_main_process()) else None,
@@ -1130,17 +1182,21 @@ def plot_triggered_n_distribution(triggered_ns, out_dir, epoch, log_path=None):
     os.makedirs(out_dir, exist_ok=True)
 
     values = np.asarray(triggered_ns, dtype=np.int64)
-    max_bin = MAX_ROLLOUT_LEN - 1
-    if values.size > 0:
-        max_bin = max(max_bin, int(values.max()))
+    valid_values = values[values >= 0]
+    no_target_count = int((values < 0).sum())
 
-    counts = np.bincount(values, minlength=max_bin + 1) if values.size > 0 else np.zeros(max_bin + 1, dtype=np.int64)
+    if valid_values.size > 0:
+        max_bin = max(MAX_ROLLOUT_LEN - 1, int(valid_values.max()))
+        counts = np.bincount(valid_values, minlength=max_bin + 1)
+    else:
+        counts = np.zeros(MAX_ROLLOUT_LEN, dtype=np.int64)
     steps = np.arange(counts.shape[0])
 
     summary_lines = [
         "",
         f"--- Epoch {epoch} Triggered N Distribution ---",
         f"Total batches: {int(values.size)}",
+        f"N=NONE: {no_target_count}",
     ]
     for step, count in zip(steps, counts):
         summary_lines.append(f"N={step:02d}: {int(count)}")
@@ -1169,6 +1225,17 @@ def plot_triggered_n_distribution(triggered_ns, out_dir, epoch, log_path=None):
         color="#cccccc",
         fontsize=9,
     )
+    if no_target_count > 0:
+        ax.text(
+            0.5,
+            0.90,
+            f"No target: {no_target_count}",
+            transform=ax.transAxes,
+            ha="center",
+            va="top",
+            color="#ffb86c",
+            fontsize=9,
+        )
     for spine in ax.spines.values():
         spine.set_edgecolor("#555")
 
@@ -1442,7 +1509,7 @@ def main():
             with open(loss_log_path, "w", encoding="utf-8") as log_file:
                 log_file.write(
                     "timestamp epoch lr bptt "
-                    "train_mse train_N train_vel "
+                    "train_mse train_N train_trigger_vel trigger_vel_count "
                     "val_mse best\n"
                 )
 
@@ -1453,7 +1520,14 @@ def main():
                 val_sampler.set_epoch(epoch)
             
             # Calibrate before every epoch so EVT thresholds track the model as it changes.
-            calibrate_velocity_threshold(model, train_loader, zero_norm, get_labels)
+            calibrate_velocity_threshold(
+                model,
+                train_loader,
+                zero_norm,
+                get_labels,
+                epoch=epoch,
+                log_path=loss_log_path,
+            )
 
             print0("\nPost-calibration warm-up (de-tainting inference tensors) ...")
             model.train()
@@ -1541,7 +1615,7 @@ def main():
 
             print0(
                 f"  train: mse={train_loss['mse']:.6e}\n"
-                f"         avg rollout N={train_loss['N']:.2e}  max N reached={train_loss['max_N']}  max allowed N={MAX_ROLLOUT_LEN}  avg_vel={train_loss['vel']:.6e}\n"
+                f"         avg rollout N={train_loss['N']:.2e}  max N reached={train_loss['max_N']}  max allowed N={MAX_ROLLOUT_LEN}  trigger_vel={train_loss['trigger_vel']:.6e}  trigger_count={train_loss['trigger_vel_count']}\n"
                 f"         pos-vel none pct={train_loss['pos_vel_none_pct']:.2f}%\n"
                 f"  val  : mse={val_loss['mse']:.6e}{best_marker}\n"
                 f"{mem_line}"
@@ -1554,7 +1628,8 @@ def main():
                         f"{datetime.now().isoformat()} epoch={epoch} lr={current_lr:.2e} bptt={BPTT_WINDOW} "
                         f"train_mse={train_loss['mse']:.6e} train_N={train_loss['N']:.2e} "
                         f"train_max_N={train_loss['max_N']} "
-                        f"train_vel={train_loss['vel']:.6e} "
+                        f"train_trigger_vel={train_loss['trigger_vel']:.6e} "
+                        f"trigger_vel_count={train_loss['trigger_vel_count']} "
                         f"val_mse={val_loss['mse']:.6e} {epoch_log_note}\n"
                     )
 
