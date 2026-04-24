@@ -668,17 +668,17 @@ def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn, epoch=
 
     We collect one statistic per batch-step by calling positive_velocity_stat()
     exactly as used in training, then bucket that statistic by its step index t.
-    Only the first 50% of calibration batches are used for speed.
+    Only the first 10% of calibration batches are used for speed.
 
     Each epoch uses the current calibration result.
     """
     global VEL_EPSILON_BY_STEP, VEL_STD_BY_STEP, VEL_COUNT_BY_STEP
 
     print0("\nCalibrating per-step EVT thresholds from fixed calibration loader (t=1..max_rollout-1) ...")
-    print0("  Using first 50% of calibration batches for speed.")
+    print0("  Using first 10% of calibration batches for speed.")
     model.eval()
     per_step_values = [[] for _ in range(MAX_ROLLOUT_LEN)]
-    max_calib_batches = max(1, len(loader) // 2)
+    max_calib_batches = max(1, len(loader) // 10)
 
     with torch.inference_mode():
         for batch_idx, (x_batch, y_seq, mask) in enumerate(
@@ -1673,9 +1673,8 @@ def main():
                 val_sampler.set_epoch(epoch)
             
             # Calibrate before every epoch so EVT thresholds track the model as it changes.
-            calib_loader = val_loader if val_loader is not None else train_loader
-            calib_name = "val_loader" if val_loader is not None else "train_loader(fallback)"
-            print0(f"Calibrating on fixed held-out loader: {calib_name}")
+            calib_loader = train_loader
+            print0("Calibrating on train split loader: train_loader")
             calibrate_velocity_threshold(
                 model,
                 calib_loader,
