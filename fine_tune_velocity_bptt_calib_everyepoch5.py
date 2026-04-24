@@ -1,5 +1,5 @@
 """
-fine_tune_velocity_bptt_calib_everyepoch4.py
+fine_tune_velocity_bptt_calib_everyepoch5.py
 =====================
 Fine-tune the frozen PDE-Transformer base model using LoRA (via PEFT) on
 autoregressive multi-step rollout with Error-Velocity Truncation (EVT)
@@ -246,7 +246,7 @@ def gather_triggered_ns(local_list):
 # User-editable configuration
 # ---------------------------------------------------------------------------
 SIM_ROOT = "./data/256_inc"
-OUT_DIR = os.path.join("runs", "karman_finetuned_velocity_LoRA_bptt_calib_everyepoch4")
+OUT_DIR = os.path.join("runs", "karman_finetuned_velocity_LoRA_bptt_calib_everyepoch5")
 EPOCHS = 40
 BATCH_SIZE = 12
 ACCUM_GRAD = 1
@@ -660,7 +660,7 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
 # Calibration
 # ---------------------------------------------------------------------------
 def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn, epoch=None, log_path=None):
-    """Survey a fraction of the train loader *once* with no gradients to collect
+    """Survey a fraction of a fixed calibration loader *once* with no gradients to collect
     first-differences of MSE errors for every rollout velocity step.
 
     Velocity at step t:
@@ -668,17 +668,17 @@ def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn, epoch=
 
     We collect one statistic per batch-step by calling positive_velocity_stat()
     exactly as used in training, then bucket that statistic by its step index t.
-    Only the first 20% of train batches are used for speed.
+    Only the first 50% of calibration batches are used for speed.
 
     Each epoch uses the current calibration result.
     """
     global VEL_EPSILON_BY_STEP, VEL_STD_BY_STEP, VEL_COUNT_BY_STEP
 
-    print0("\nCalibrating per-step EVT thresholds from train set (t=1..max_rollout-1) ...")
-    print0("  Using first 20% of train batches for speed.")
+    print0("\nCalibrating per-step EVT thresholds from fixed calibration loader (t=1..max_rollout-1) ...")
+    print0("  Using first 50% of calibration batches for speed.")
     model.eval()
     per_step_values = [[] for _ in range(MAX_ROLLOUT_LEN)]
-    max_calib_batches = max(1, len(loader) // 5)
+    max_calib_batches = max(1, len(loader) // 2)
 
     with torch.inference_mode():
         for batch_idx, (x_batch, y_seq, mask) in enumerate(
@@ -748,14 +748,12 @@ def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn, epoch=
     total_obs = float(np.sum(global_count[1:]))
     print0(f"  Positive velocity batch-step candidates (all steps): {int(total_obs)}")
 
-    if total_obs <= 0:
-        fallback_mean = 1e-4
-        fallback_std = 5e-5
-        print0("  WARNING: no valid calibration samples found. Using fallback thresholds.")
-    else:
-        fallback_mean = float(np.sum(global_sum[1:]) / total_obs)
-        fallback_var = float(np.sum(global_sum_sq[1:]) / total_obs - fallback_mean * fallback_mean)
-        fallback_std = float(np.sqrt(max(fallback_var, 0.0)))
+    prev_eps = None
+    prev_std = None
+    if VEL_EPSILON_BY_STEP is not None:
+        prev_eps = np.asarray(VEL_EPSILON_BY_STEP, dtype=np.float32)
+    if VEL_STD_BY_STEP is not None:
+        prev_std = np.asarray(VEL_STD_BY_STEP, dtype=np.float32)
 
     eps_by_step = np.zeros(MAX_ROLLOUT_LEN, dtype=np.float32)
     std_by_step = np.zeros(MAX_ROLLOUT_LEN, dtype=np.float32)
@@ -763,25 +761,56 @@ def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn, epoch=
     eps_by_step[0] = 0.0
     std_by_step[0] = 0.0
 
-    print0("  Per-step EVT calibration (index 0 unused):")
-    print0(f"    {'step':>4} {'count':>8} {'mean':>12} {'std':>12} {'source':>10}")
-    table_rows = []
+    observed_mean = {}
+    observed_std = {}
+    observed_steps = []
     for t in range(1, MAX_ROLLOUT_LEN):
         c = float(global_count[t])
-        count_by_step[t] = int(c)
         if c > 0:
             mean_t = float(global_sum[t] / c)
             var_t = float(global_sum_sq[t] / c - mean_t * mean_t)
             std_t = float(np.sqrt(max(var_t, 0.0)))
+            observed_mean[t] = mean_t
+            observed_std[t] = std_t
+            observed_steps.append(t)
+
+    print0("  Per-step EVT calibration (index 0 unused):")
+    print0(f"    {'step':>4} {'count':>8} {'eps':>12} {'std':>12} {'source':>16}")
+    table_rows = []
+    for t in range(1, MAX_ROLLOUT_LEN):
+        c = float(global_count[t])
+        count_by_step[t] = int(c)
+
+        if c > 0:
+            base_eps_t = float(observed_mean[t])
+            std_t = float(observed_std[t])
             source_t = "observed"
+        elif prev_eps is not None and t < prev_eps.shape[0] and np.isfinite(prev_eps[t]):
+            base_eps_t = float(prev_eps[t])
+            if prev_std is not None and t < prev_std.shape[0] and np.isfinite(prev_std[t]):
+                std_t = float(prev_std[t])
+            else:
+                std_t = 0.0
+            source_t = "prev_epoch"
+        elif observed_steps:
+            nearest_t = min(observed_steps, key=lambda k: abs(k - t))
+            base_eps_t = float(observed_mean[nearest_t])
+            std_t = float(observed_std[nearest_t])
+            source_t = f"nearest@{nearest_t}"
         else:
-            mean_t = fallback_mean
-            std_t = fallback_std
-            source_t = "fallback"
+            base_eps_t = 2e-5
+            std_t = 0.0
+            source_t = "default"
+
+        if prev_eps is not None and t < prev_eps.shape[0] and np.isfinite(prev_eps[t]):
+            mean_t = 0.5 * (base_eps_t + float(prev_eps[t]))
+            source_t = f"{source_t}+avg"
+        else:
+            mean_t = base_eps_t
 
         eps_by_step[t] = float(mean_t)
         std_by_step[t] = float(std_t)
-        print0(f"    {t:>4d} {int(c):>8d} {mean_t:>12.6e} {std_t:>12.6e} {source_t:>10}")
+        print0(f"    {t:>4d} {int(c):>8d} {mean_t:>12.6e} {std_t:>12.6e} {source_t:>16}")
         table_rows.append((
             int(epoch) if epoch is not None else -1,
             t,
@@ -902,6 +931,8 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                 if fixed_target != -1 and fixed_target >= max_rollout:
                     fixed_target = max_rollout - 1
 
+                # Trigger detection mirrors calibration semantics: deterministic eval mode.
+                model.eval()
                 with torch.no_grad():
                     state = x_batch
                     for t in range(max_rollout):
@@ -928,13 +959,15 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                                 threshold_t = float(vel_threshold_by_step[t])
                                 if curr_vel > threshold_t:
                                     triggered_vel = float(curr_vel)
-                                    target_N = t - 1
+
+                                    target_N = t
                                     break
                             else:
                                 missing_pos_vel_steps += 1
 
                         prev_err_per_sample = mse_per_sample
                         state = torch.lerp(zero_norm, pred_dry, mask)
+                model.train()
 
                 local_available_last = len(states_seq) - 1
 
@@ -1630,7 +1663,7 @@ def main():
                 log_file.write(
                     "timestamp epoch lr bptt "
                     "train_mse train_N train_trigger_vel trigger_vel_count "
-                    "val_mse best\n"
+                    "train_max_N val_mse best\n"
                 )
 
         for epoch in range(start_epoch, EPOCHS + 1):
@@ -1640,9 +1673,12 @@ def main():
                 val_sampler.set_epoch(epoch)
             
             # Calibrate before every epoch so EVT thresholds track the model as it changes.
+            calib_loader = val_loader if val_loader is not None else train_loader
+            calib_name = "val_loader" if val_loader is not None else "train_loader(fallback)"
+            print0(f"Calibrating on fixed held-out loader: {calib_name}")
             calibrate_velocity_threshold(
                 model,
-                train_loader,
+                calib_loader,
                 zero_norm,
                 get_labels,
                 epoch=epoch,
