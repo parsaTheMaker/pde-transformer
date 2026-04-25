@@ -1,28 +1,24 @@
 """
-fine_tune_velocity_bptt_calib_everyepoch5.py
+fine_tune_velocity_bptt_noCalib
 =====================
 Fine-tune the frozen PDE-Transformer base model using LoRA (via PEFT) on
-autoregressive multi-step rollout with Error-Velocity Truncation (EVT)
+autoregressive multi-step rollout with an epoch-local rollout curriculum
 for long-rollout stability.
 
 Key design decisions:
   - MSE loss is computed on raw model output (no mask in loss).
   - The mask is applied ONLY when advancing the rollout state.
-  - EVT trigger: only fire if the step-wise velocity (E_t - E_{t-1})
-    exceeds the calibrated threshold.
-  - Truncated Pushforward: Instead of just backpropagating through a single 
-    failed step, we backpropagate through a sliding window of previous steps 
-    (BPTT_WINDOW) to teach the model how to prevent the error from compounding.
-    - Deterministic EVT thresholds (VEL_EPSILON_BY_STEP[t]) are calibrated per
-        rollout step from mean velocity statistics; VEL_STD_BY_STEP is diagnostic.
-  - LoRA (r=16, alpha=16) is injected into qkv, to_qkv, fc1, fc2 via PEFT.
+    - Every epoch starts at curriculum frontier N=1 (second rollout step).
+    - Promotion is stage-based and uses a 20% frontier-velocity improvement rule.
+    - Full BPTT is applied through all steps 0..N with equal-weight mean loss.
+    - Curriculum stage state resets on every promotion and at each epoch.
+    - LoRA is injected into qkv, to_qkv, fc1, fc2 via PEFT.
 """
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import math
-import random
 import sys
 from contextlib import suppress
 from datetime import datetime
@@ -39,6 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from matplotlib.colors import Normalize
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -48,15 +45,9 @@ from tqdm import tqdm
 from peft import LoraConfig, get_peft_model
 
 # ---------------------------------------------------------------------------
-# Error-Velocity Truncation (EVT) Configuration
+# Rollout curriculum configuration
 # ---------------------------------------------------------------------------
 MAX_ROLLOUT_LEN = 8
-BPTT_WINDOW = 3        # Number of steps to backpropagate through (Truncated Pushforward)
-
-# Thresholds are set automatically by calibrate_velocity_threshold()
-VEL_EPSILON_BY_STEP = None   # per-step deterministic EVT threshold (index 0 unused)
-VEL_STD_BY_STEP = None       # per-step diagnostic velocity spread (index 0 unused)
-VEL_COUNT_BY_STEP = None     # per-step candidate count from calibration (index 0 unused)
 
 if os.name != "nt":
     os.environ["LD_LIBRARY_PATH"] = (
@@ -91,9 +82,6 @@ try:
         torch.nn.attention.flex_attention.AuxRequest = AuxRequest
 except (ImportError, AttributeError):
     pass
-
-torch.manual_seed(42)
-np.random.seed(42)
 
 # ---------------------------------------------------------------------------
 # Distributed (DDP) globals
@@ -213,42 +201,15 @@ def gather_val_mses(local_arr):
     return np.concatenate(arrays, axis=0)
 
 
-def gather_triggered_ns(local_list):
-    if not DDP_ENABLED:
-        return local_list
-
-    local_np = np.asarray(local_list, dtype=np.int64)
-    local_len = int(local_np.size)
-
-    len_tensor = torch.tensor([local_len], dtype=torch.int64, device=DEVICE)
-    gathered_lens_t = [torch.zeros(1, dtype=torch.int64, device=DEVICE) for _ in range(WORLD_SIZE)]
-    dist.all_gather(gathered_lens_t, len_tensor)
-    lengths = [int(t.item()) for t in gathered_lens_t]
-    max_len = max(lengths) if lengths else 0
-
-    padded_local = torch.zeros((max_len,), dtype=torch.int64, device=DEVICE)
-    if local_len > 0:
-        padded_local[:local_len] = torch.as_tensor(local_np, dtype=torch.int64, device=DEVICE)
-
-    gathered = [torch.empty_like(padded_local) for _ in range(WORLD_SIZE)]
-    dist.all_gather(gathered, padded_local)
-
-    if not is_main_process():
-        return None
-
-    merged = []
-    for rank_tensor, rank_len in zip(gathered, lengths):
-        if rank_len > 0:
-            merged.extend(rank_tensor[:rank_len].cpu().tolist())
-    return merged
-
 # ---------------------------------------------------------------------------
 # User-editable configuration
 # ---------------------------------------------------------------------------
+GLOBAL_SEED = 42
+
 SIM_ROOT = "./data/256_inc"
-OUT_DIR = os.path.join("runs", "karman_finetuned_velocity_LoRA_bptt_calib_everyepoch5")
+OUT_DIR = os.path.join("runs", "karman_finetuned_velocity_LoRA_bptt_noCalib_curriculum2")
 EPOCHS = 40
-BATCH_SIZE = 12
+BATCH_SIZE = 6
 ACCUM_GRAD = 1
 LR = 5e-5
 VAL_FRAC = 0.1
@@ -262,6 +223,18 @@ DPI_VID = 110
 SKIP_TRAIN = False
 RESUME_CHECKPOINT = "./runs/karman_mse/last.ckpt"
 MODEL_TYPE = "PDE-S"
+MODEL_SAMPLE_SIZE = 256
+MODEL_IN_CHANNELS = 3
+MODEL_OUT_CHANNELS = 3
+MODEL_PATCH_SIZE = 4
+MODEL_PERIODIC = False
+MODEL_CARRIER_TOKEN_ACTIVE = True
+
+LORA_R = 16
+LORA_ALPHA = 16
+LORA_TARGET_MODULES = ["qkv", "to_qkv", "fc1", "fc2"]
+LORA_DROPOUT = 0.05
+
 USE_AMP = DEVICE == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 USE_CHANNELS_LAST = False
 NUM_WORKERS = max(0, cpu_count() - 5)
@@ -280,6 +253,34 @@ TQDM_UPDATE_EVERY = 20
 DDP_BUCKET_CAP_MB = 100
 DDP_USE_STATIC_GRAPH = False
 N_PROGRESS_EMA_ALPHA = 0.15
+
+OPTIM_WEIGHT_DECAY = 1e-6
+GRAD_CLIP_NORM = 1.0
+SCHED_STEP_SIZE = 10
+SCHED_GAMMA = 0.25
+TASK_LABEL_ID = 1000
+
+# Curriculum hyperparameter (epoch 1 value). Effective value decays to 30% of
+# this by the last epoch.
+VELOCITY_IMPROVEMENT_FRAC = 0.30
+# Geometric decay factor per schedule epoch (e.g. 0.20 -> 0.16 -> 0.128 ...).
+IMPROVEMENT_DECAY_GAMMA = 0.6
+# Hard minimum improvement requirement (1%).
+MIN_IMPROVEMENT_FRAC = 0.01
+# Method rule (fixed): lock stage baseline after exactly 10 frontier-reaching batches.
+MIN_STAGE_BATCHES = 20
+# Method rule (fixed): promotion compares the average over the latest 3
+# frontier-reaching batches against the prior-stage baseline average.
+RECENT_PROMO_WINDOW = 5
+# Memory optimization: recompute training activations during backward to reduce VRAM.
+USE_ACTIVATION_CHECKPOINTING = True
+
+NORM_STD_EPS = 1e-6
+WARMUP_DUMMY_BATCH = 1
+VIDEO_START_FRAC = 0.50
+VIDEO_END_FRAC = 0.75
+VIDEO_CODEC = "libx264"
+VIDEO_BITRATE = 1800
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +329,7 @@ def compute_global_stats(train_sim_infos, fallback_sim_infos, target_samples=200
 
     stacked = np.concatenate(samples, axis=0)
     mean = torch.tensor(stacked.mean(axis=(0, 2, 3)), dtype=torch.float32)
-    std = torch.tensor(stacked.std(axis=(0, 2, 3)), dtype=torch.float32) + 1e-6
+    std = torch.tensor(stacked.std(axis=(0, 2, 3)), dtype=torch.float32) + NORM_STD_EPS
     return mean, std
 
 
@@ -488,13 +489,13 @@ def get_model():
     from pdetransformer.core.mixed_channels.pde_transformer import PDETransformer
 
     base_model = PDETransformer(
-        sample_size=256,
-        in_channels=3,
-        out_channels=3,
+        sample_size=MODEL_SAMPLE_SIZE,
+        in_channels=MODEL_IN_CHANNELS,
+        out_channels=MODEL_OUT_CHANNELS,
         type=MODEL_TYPE,
-        patch_size=4,
-        periodic=False,
-        carrier_token_active=True,
+        patch_size=MODEL_PATCH_SIZE,
+        periodic=MODEL_PERIODIC,
+        carrier_token_active=MODEL_CARRIER_TOKEN_ACTIVE,
     )
     
     peft_resume = os.path.join(OUT_DIR, "last.ckpt")
@@ -511,10 +512,10 @@ def get_model():
         base_model = base_model.to(memory_format=torch.channels_last)
 
     lora_config = LoraConfig(
-        r=16,
-        lora_alpha=16,
-        target_modules=["qkv", "to_qkv", "fc1", "fc2"],
-        lora_dropout=0.05,
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        target_modules=LORA_TARGET_MODULES,
+        lora_dropout=LORA_DROPOUT,
         bias="none",
     )
     peft_model = get_peft_model(base_model, lora_config)
@@ -530,7 +531,7 @@ def create_optimizer(model):
     params = [p for p in model.parameters() if p.requires_grad]
     adamw_kwargs = {
         "lr": LR,
-        "weight_decay": 1e-6,
+        "weight_decay": OPTIM_WEIGHT_DECAY,
         "foreach": torch.cuda.is_available(),
     }
     if torch.cuda.is_available():
@@ -558,7 +559,7 @@ def move_batch_to_device(x, y_seq, mask):
     return x, y_seq, mask
 
 
-def update_progress(progress_bar, loss_dict, sample_count, n_count=0, trigger_vel_sum=0.0, trigger_vel_count=0):
+def update_progress(progress_bar, loss_dict, sample_count, n_count=0, frontier_vel_running=None, frontier_n=None):
     mse_denom = max(1, sample_count)
     mse_avg = loss_dict["mse"] / mse_denom
     mse_avg = mse_avg.detach().item() if isinstance(mse_avg, torch.Tensor) else float(mse_avg)
@@ -569,16 +570,14 @@ def update_progress(progress_bar, loss_dict, sample_count, n_count=0, trigger_ve
     else:
         n_str = "N/A"
 
-    if trigger_vel_count > 0:
-        vel_avg = float(trigger_vel_sum) / float(trigger_vel_count)
-        vel_str = f"{vel_avg:.6e}"
-    else:
-        vel_str = "N/A"
+    vel_str = f"{float(frontier_vel_running):.6e}" if frontier_vel_running is not None else "N/A"
+    frontier_n_str = str(int(frontier_n)) if frontier_n is not None else "N/A"
 
     progress_bar.set_postfix(
         mse=f"{mse_avg:.6e}",
         N=n_str,
-        vel=vel_str,
+        frontierN=frontier_n_str,
+        frontier_vel=vel_str,
     )
 
 
@@ -608,12 +607,61 @@ def per_sample_mse(pred, target):
     return F.mse_loss(pred, target, reduction="none").mean(dim=(1, 2, 3))
 
 
-def positive_velocity_stat(curr_err_per_sample, prev_err_per_sample):
+def model_predict_sample(model, state, labels, training):
+    """Forward pass helper with optional activation checkpointing for training memory savings."""
+    if training and USE_ACTIVATION_CHECKPOINTING:
+        def _forward(inp, lbl):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
+                out = model(inp, class_labels=lbl).sample
+            return out.float()
+
+        with suppress(TypeError):
+            return activation_checkpoint(
+                _forward,
+                state,
+                labels,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        return activation_checkpoint(
+            _forward,
+            state,
+            labels,
+            use_reentrant=False,
+        )
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
+        pred_raw = model(state, class_labels=labels).sample
+    return pred_raw.float()
+
+
+def positive_velocity_sum_count(curr_err_per_sample, prev_err_per_sample):
     vel = curr_err_per_sample - prev_err_per_sample
     pos_vel = vel[vel > 0]
-    if pos_vel.numel() == 0:
-        return None, 0
-    return float(pos_vel.mean().item()), int(pos_vel.numel())
+    return float(pos_vel.sum().item()), int(pos_vel.numel())
+
+
+def global_positive_velocity(curr_err_per_sample, prev_err_per_sample):
+    local_sum, local_count = positive_velocity_sum_count(curr_err_per_sample, prev_err_per_sample)
+    stats = torch.tensor([local_sum, float(local_count)], dtype=torch.float64, device=DEVICE)
+    if DDP_ENABLED:
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    global_sum = float(stats[0].item())
+    global_count = int(stats[1].item())
+    global_vel = global_sum / float(global_count) if global_count > 0 else 0.0
+    return global_vel, global_sum, global_count
+
+
+def epoch_improvement_fraction(epoch, total_epochs, initial_frac, gamma=IMPROVEMENT_DECAY_GAMMA, min_frac=MIN_IMPROVEMENT_FRAC):
+    """Geometrically decay required improvement with a minimum floor.
+
+    Example with initial=0.20, gamma=0.8: 0.20, 0.16, 0.128, ...
+    The returned value is clamped below by min_frac.
+    """
+    _ = total_epochs  # Kept for call-site compatibility and schedule-window semantics.
+    epoch_idx = max(1, int(epoch))
+    value = float(initial_frac) * (float(gamma) ** float(epoch_idx - 1))
+    return max(float(min_frac), value)
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, best_metric, train_losses, val_losses):
@@ -657,190 +705,9 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
 
 
 # ---------------------------------------------------------------------------
-# Calibration
-# ---------------------------------------------------------------------------
-def calibrate_velocity_threshold(model, loader, zero_norm, get_labels_fn, epoch=None, log_path=None):
-    """Survey a fraction of a fixed calibration loader *once* with no gradients to collect
-    first-differences of MSE errors for every rollout velocity step.
-
-    Velocity at step t:
-        v_t = E_t - E_{t-1}
-
-    We collect one statistic per batch-step by calling positive_velocity_stat()
-    exactly as used in training, then bucket that statistic by its step index t.
-    Only the first 10% of calibration batches are used for speed.
-
-    Each epoch uses the current calibration result.
-    """
-    global VEL_EPSILON_BY_STEP, VEL_STD_BY_STEP, VEL_COUNT_BY_STEP
-
-    print0("\nCalibrating per-step EVT thresholds from fixed calibration loader (t=1..max_rollout-1) ...")
-    print0("  Using first 10% of calibration batches for speed.")
-    model.eval()
-    per_step_values = [[] for _ in range(MAX_ROLLOUT_LEN)]
-    max_calib_batches = max(1, len(loader) // 10)
-
-    with torch.inference_mode():
-        for batch_idx, (x_batch, y_seq, mask) in enumerate(
-            tqdm(loader, desc="calib", leave=False, disable=not is_main_process(), dynamic_ncols=True, total=max_calib_batches)
-        ):
-            if batch_idx >= max_calib_batches:
-                break
-
-            x_batch, y_seq, mask = move_batch_to_device(x_batch, y_seq, mask)
-            labels = get_labels_fn(x_batch.shape[0])
-
-            max_rollout = min(MAX_ROLLOUT_LEN, y_seq.shape[1])
-            if max_rollout < 2:
-                continue
-
-            if mask.ndim == 3:
-                mask = mask.unsqueeze(1)
-
-            state = x_batch.clone()
-            prev_err_per_sample = None
-
-            for t in range(max_rollout):
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
-                    pred = model(state, class_labels=labels).sample
-                pred = pred.float()
-
-                y_t = y_seq[:, t]
-                mse_per_sample = per_sample_mse(pred, y_t)
-
-                if not torch.isfinite(mse_per_sample).all():
-                    prev_err_per_sample = None
-                    break
-
-                if prev_err_per_sample is not None:
-                    step_stat, _ = positive_velocity_stat(mse_per_sample, prev_err_per_sample)
-                    if step_stat is not None:
-                        per_step_values[t].append(step_stat)
-
-                prev_err_per_sample = mse_per_sample
-                state = torch.lerp(zero_norm, pred, mask)
-
-    local_count = np.zeros(MAX_ROLLOUT_LEN, dtype=np.float64)
-    local_sum = np.zeros(MAX_ROLLOUT_LEN, dtype=np.float64)
-    local_sum_sq = np.zeros(MAX_ROLLOUT_LEN, dtype=np.float64)
-    for t in range(1, MAX_ROLLOUT_LEN):
-        if per_step_values[t]:
-            vals = np.asarray(per_step_values[t], dtype=np.float64)
-            local_count[t] = float(vals.size)
-            local_sum[t] = float(vals.sum())
-            local_sum_sq[t] = float(np.square(vals).sum())
-
-    stats = torch.stack(
-        [
-            torch.as_tensor(local_count, dtype=torch.float64, device=DEVICE),
-            torch.as_tensor(local_sum, dtype=torch.float64, device=DEVICE),
-            torch.as_tensor(local_sum_sq, dtype=torch.float64, device=DEVICE),
-        ],
-        dim=0,
-    )
-    if DDP_ENABLED:
-        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-
-    global_count = stats[0].cpu().numpy()
-    global_sum = stats[1].cpu().numpy()
-    global_sum_sq = stats[2].cpu().numpy()
-
-    total_obs = float(np.sum(global_count[1:]))
-    print0(f"  Positive velocity batch-step candidates (all steps): {int(total_obs)}")
-
-    prev_eps = None
-    prev_std = None
-    if VEL_EPSILON_BY_STEP is not None:
-        prev_eps = np.asarray(VEL_EPSILON_BY_STEP, dtype=np.float32)
-    if VEL_STD_BY_STEP is not None:
-        prev_std = np.asarray(VEL_STD_BY_STEP, dtype=np.float32)
-
-    eps_by_step = np.zeros(MAX_ROLLOUT_LEN, dtype=np.float32)
-    std_by_step = np.zeros(MAX_ROLLOUT_LEN, dtype=np.float32)
-    count_by_step = np.zeros(MAX_ROLLOUT_LEN, dtype=np.int64)
-    eps_by_step[0] = 0.0
-    std_by_step[0] = 0.0
-
-    observed_mean = {}
-    observed_std = {}
-    observed_steps = []
-    for t in range(1, MAX_ROLLOUT_LEN):
-        c = float(global_count[t])
-        if c > 0:
-            mean_t = float(global_sum[t] / c)
-            var_t = float(global_sum_sq[t] / c - mean_t * mean_t)
-            std_t = float(np.sqrt(max(var_t, 0.0)))
-            observed_mean[t] = mean_t
-            observed_std[t] = std_t
-            observed_steps.append(t)
-
-    print0("  Per-step EVT calibration (index 0 unused):")
-    print0(f"    {'step':>4} {'count':>8} {'eps':>12} {'std':>12} {'source':>16}")
-    table_rows = []
-    for t in range(1, MAX_ROLLOUT_LEN):
-        c = float(global_count[t])
-        count_by_step[t] = int(c)
-
-        if c > 0:
-            base_eps_t = float(observed_mean[t])
-            std_t = float(observed_std[t])
-            source_t = "observed"
-        elif prev_eps is not None and t < prev_eps.shape[0] and np.isfinite(prev_eps[t]):
-            base_eps_t = float(prev_eps[t])
-            if prev_std is not None and t < prev_std.shape[0] and np.isfinite(prev_std[t]):
-                std_t = float(prev_std[t])
-            else:
-                std_t = 0.0
-            source_t = "prev_epoch"
-        elif observed_steps:
-            nearest_t = min(observed_steps, key=lambda k: abs(k - t))
-            base_eps_t = float(observed_mean[nearest_t])
-            std_t = float(observed_std[nearest_t])
-            source_t = f"nearest@{nearest_t}"
-        else:
-            base_eps_t = 2e-5
-            std_t = 0.0
-            source_t = "default"
-
-        if prev_eps is not None and t < prev_eps.shape[0] and np.isfinite(prev_eps[t]):
-            mean_t = 0.5 * (base_eps_t + float(prev_eps[t]))
-            source_t = f"{source_t}+avg"
-        else:
-            mean_t = base_eps_t
-
-        eps_by_step[t] = float(mean_t)
-        std_by_step[t] = float(std_t)
-        print0(f"    {t:>4d} {int(c):>8d} {mean_t:>12.6e} {std_t:>12.6e} {source_t:>16}")
-        table_rows.append((
-            int(epoch) if epoch is not None else -1,
-            t,
-            int(c),
-            float(mean_t),
-            float(std_t),
-            source_t,
-        ))
-
-    VEL_EPSILON_BY_STEP = eps_by_step
-    VEL_STD_BY_STEP = std_by_step
-    VEL_COUNT_BY_STEP = count_by_step
-
-    if is_main_process() and log_path:
-        with open(log_path, "a", encoding="utf-8") as f:
-            epoch_label = int(epoch) if epoch is not None else -1
-            f.write(f"--- Epoch {epoch_label} Per-step EVT Calibration ---\n")
-            f.write("epoch step count vel_epsilon vel_std source\n")
-            for row in table_rows:
-                f.write(
-                    f"{row[0]} {row[1]} {row[2]} "
-                    f"{row[3]:.6e} {row[4]:.6e} {row[5]}\n"
-                )
-            f.write("\n")
-
-
-# ---------------------------------------------------------------------------
 # Training / evaluation loop
 # ---------------------------------------------------------------------------
-def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None, global_step=0):
+def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None, epoch=None, total_epochs=None):
     """Run one full epoch.
 
     MSE loss contract:
@@ -849,13 +716,13 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
     Masking (obstacle enforcement):
         state = torch.lerp(zero_norm, pred_raw, mask)
 
-    Error-Velocity Truncation (training only):
-        - At each step t >= 1, compute the first-difference:
-              v_t = E_t - E_{t-1}
-          - Trigger condition: v_t > VEL_EPSILON_BY_STEP[t]
-              (deterministic per-step threshold).
-        - When triggered: Backpropagate through a sliding window (BPTT_WINDOW)
-          ending at step t-1 using the Pushforward method.
+    Epoch-local rollout curriculum (training only):
+        - Every epoch starts at frontier N=1 (second rollout step).
+        - Each batch trains with full BPTT on steps 0..N using equal-weight mean loss.
+                - Promotion is stage-based and uses an epoch-decayed improvement target.
+                - Promotion condition checks mean(last 3 frontier velocities) against
+                    mean(prior stage frontier velocities), requiring at least 10 prior
+                    batches before evaluating the condition.
     """
     if training:
         model.train()
@@ -871,47 +738,42 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
     }
     sample_count = 0
     n_count = 0
-    trigger_vel_sum = 0.0
-    trigger_vel_count = 0
+    frontier_vel_sum = 0.0
+    frontier_vel_count = 0
     batch_progress = [] if (training and is_main_process()) else None
     batch_n_values = [] if (training and is_main_process()) else None
-    batch_is_forced_n0 = [] if (training and is_main_process()) else None
     all_val_mses = [] if not training else None
-    triggered_ns = [] if training else None
     max_rollout_seen = 0
-    max_target_N = -1
-    missing_pos_vel_steps = 0
-    vel_candidate_steps = 0
+    max_frontier_N = -1
+
+    # Curriculum resets at the start of every epoch.
+    current_target_N = 1
+    stage_batch_count = 0
+    stage_frontier_vels = []
+    stage_vel_sum = 0.0
+    stage_baseline_vel = None
+    promotion_count = 0
+    running_stage_vel = None
+
+    if training:
+        # epoch/total_epochs are expected to represent the schedule window for
+        # the *current run* (not absolute checkpoint epoch indices).
+        epoch_idx = int(epoch) if epoch is not None else 1
+        total_ep = int(total_epochs) if total_epochs is not None else EPOCHS
+        epoch_idx = max(1, min(epoch_idx, total_ep))
+        improvement_frac = epoch_improvement_fraction(
+            epoch=epoch_idx,
+            total_epochs=total_ep,
+            initial_frac=VELOCITY_IMPROVEMENT_FRAC,
+            gamma=IMPROVEMENT_DECAY_GAMMA,
+            min_frac=MIN_IMPROVEMENT_FRAC,
+        )
+    else:
+        improvement_frac = float("nan")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     n_batches = len(loader)
-
-    if training:
-        # Keep stochastic controls identical across DDP ranks.
-        rng_seed = 12345 + int(global_step)
-        py_rng = random.Random(rng_seed)
-        if VEL_EPSILON_BY_STEP is None:
-            vel_threshold_by_step = np.full(MAX_ROLLOUT_LEN, 2e-5, dtype=np.float32)
-        else:
-            eps_by_step = np.asarray(VEL_EPSILON_BY_STEP, dtype=np.float32)
-            if eps_by_step.shape[0] < MAX_ROLLOUT_LEN:
-                padded_eps = np.full(MAX_ROLLOUT_LEN, 2e-5, dtype=np.float32)
-                padded_eps[: eps_by_step.shape[0]] = eps_by_step
-                eps_by_step = padded_eps
-
-            if VEL_STD_BY_STEP is None:
-                std_by_step = np.zeros_like(eps_by_step, dtype=np.float32)
-            else:
-                std_by_step = np.asarray(VEL_STD_BY_STEP, dtype=np.float32)
-                if std_by_step.shape[0] < MAX_ROLLOUT_LEN:
-                    padded_std = np.zeros(MAX_ROLLOUT_LEN, dtype=np.float32)
-                    padded_std[: std_by_step.shape[0]] = std_by_step
-                    std_by_step = padded_std
-
-            vel_threshold_by_step = eps_by_step - std_by_step
-    else:
-        vel_threshold_by_step = None
 
     context = torch.enable_grad if training else torch.inference_mode
     with context():
@@ -928,134 +790,87 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                 mask = mask.unsqueeze(1)   
 
             if training:
-                states_seq = []  
+                effective_target_N = min(current_target_N, max_rollout - 1)
+                state = x_batch
                 prev_err_per_sample = None
-                triggered_vel = None
-                target_N = -1     
+                loss_sum = torch.zeros((), device=DEVICE)
+                batch_frontier_vel = None
 
-                rand_val = py_rng.random()
-                if rand_val < 0.25:
-                    fixed_target = 0
-                else:
-                    fixed_target = -1
+                for t in range(effective_target_N + 1):
+                    pred_raw = model_predict_sample(model, state, labels, training=True)
 
-                if fixed_target != -1 and fixed_target >= max_rollout:
-                    fixed_target = max_rollout - 1
+                    y_t = y_seq[:, t]
+                    loss_sum = loss_sum + F.mse_loss(pred_raw, y_t)
 
-                # Trigger detection mirrors calibration semantics: deterministic eval mode.
-                model.eval()
-                with torch.no_grad():
-                    state = x_batch
-                    for t in range(max_rollout):
-                        states_seq.append(state)
+                    # Curriculum statistics are detached from autograd to avoid graph retention.
+                    mse_per_sample = per_sample_mse(pred_raw, y_t).detach()
 
-                        if fixed_target != -1 and t == fixed_target:
-                            target_N = t
-                            break
+                    if t == effective_target_N and t >= 1 and prev_err_per_sample is not None:
+                        frontier_vel, _, _ = global_positive_velocity(mse_per_sample, prev_err_per_sample)
+                        batch_frontier_vel = float(frontier_vel)
 
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
-                            pred_dry = model(state, class_labels=labels).sample
-                        pred_dry = pred_dry.float()
+                    prev_err_per_sample = mse_per_sample
+                    if t < effective_target_N:
+                        state = torch.lerp(zero_norm, pred_raw, mask)
 
-                        mse_per_sample = per_sample_mse(pred_dry, y_seq[:, t])
-                        if not torch.isfinite(mse_per_sample).all():
-                            break
-
-                        target_N = t
-
-                        if fixed_target == -1 and prev_err_per_sample is not None:
-                            vel_candidate_steps += 1
-                            curr_vel, _ = positive_velocity_stat(mse_per_sample, prev_err_per_sample)
-                            if curr_vel is not None:
-                                threshold_t = float(vel_threshold_by_step[t])
-                                if curr_vel > threshold_t:
-                                    triggered_vel = float(curr_vel)
-
-                                    target_N = t
-                                    break
-                            else:
-                                missing_pos_vel_steps += 1
-
-                        prev_err_per_sample = mse_per_sample
-                        state = torch.lerp(zero_norm, pred_dry, mask)
-                model.train()
-
-                local_available_last = len(states_seq) - 1
-
-                # Keep truncation decision local per rank so EVT semantics
-                # reflect the local positive-velocity statistic.
-                if target_N >= 0:
-                    target_N = min(target_N, local_available_last)
-
-                if target_N < 0:
-                    target_N = -1
-
-                if triggered_ns is not None:
-                    triggered_ns.append(int(target_N))
+                loss_to_backprop = loss_sum / float(effective_target_N + 1)
 
                 if batch_n_values is not None:
                     batch_progress.append(float(step + 1) / float(max(1, n_batches)))
-                    batch_n_values.append(float(target_N) if target_N >= 0 else np.nan)
-                    batch_is_forced_n0.append(bool(fixed_target == 0))
-
-                # --- Phase 2: Sliding Window Pushforward with Grad ---
-                loss_to_backprop = None
-                
-                if target_N >= 0:
-                    # Calculate where our gradient window should start
-                    window_start = max(0, target_N - BPTT_WINDOW + 1)
-                    
-                    # Grab the clean, detached input state from Phase 1
-                    current_state = states_seq[window_start].detach()
-                    window_loss = torch.zeros((), device=DEVICE)
-                    weight_sum = 0.0
-                    
-                    for t in range(window_start, target_N + 1):
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
-                            pred_raw = model(current_state, class_labels=labels).sample
-                        pred_raw = pred_raw.float()
-                        
-                        # Geometric Weighting: Target step gets full weight. Steps leading up to it get partial weight.
-                        weight = 1.0 if t == target_N else 0.5
-                        
-                        step_loss = F.mse_loss(pred_raw, y_seq[:, t])
-                        window_loss += step_loss * weight
-                        weight_sum += weight
-                        
-                        # If this isn't the last step in the window, advance the state differentiably
-                        if t < target_N:
-                            current_state = torch.lerp(zero_norm, pred_raw, mask)
-                            
-                    # Average the accumulated loss over the window size
-                    loss_to_backprop = window_loss / max(weight_sum, 1e-12)
-
-                if loss_to_backprop is None:
-                    # Keep DDP ranks synchronized: even if EVT finds no valid
-                    # rollback target on this rank, run a zero-weight loss so
-                    # every rank still executes backward/all-reduce.
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
-                        pred_fallback = model(x_batch, class_labels=labels).sample
-                    pred_fallback = pred_fallback.float()
-                    loss_to_backprop = F.mse_loss(pred_fallback, y_seq[:, 0]) * 0.0
+                    batch_n_values.append(float(effective_target_N))
 
                 (loss_to_backprop / ACCUM_GRAD).backward()
 
                 if (step + 1) % ACCUM_GRAD == 0 or (step + 1) == n_batches:
-                    torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                    torch.nn.utils.clip_grad_norm_(trainable_params, GRAD_CLIP_NORM)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
-                # Include every processed training batch in reporting averages,
-                # including zero-loss fallback steps, to avoid optimistic bias.
                 loss_accum["mse"] += loss_to_backprop.detach() * batch_size
-                if target_N >= 0:
-                    loss_accum["N"] += target_N * batch_size
-                    n_count += batch_size
-                    max_target_N = max(max_target_N, target_N)
-                if triggered_vel is not None:
-                    trigger_vel_sum += float(triggered_vel)
-                    trigger_vel_count += 1
+                loss_accum["N"] += effective_target_N * batch_size
+                n_count += batch_size
+                max_frontier_N = max(max_frontier_N, effective_target_N)
                 sample_count += batch_size
+
+                if batch_frontier_vel is not None:
+                    frontier_vel_sum += float(batch_frontier_vel)
+                    frontier_vel_count += 1
+
+                if (
+                    batch_frontier_vel is not None
+                    and current_target_N < (MAX_ROLLOUT_LEN - 1)
+                    and effective_target_N == current_target_N
+                ):
+                    stage_frontier_vels.append(float(batch_frontier_vel))
+                    stage_batch_count = len(stage_frontier_vels)
+                    stage_vel_sum = float(np.sum(stage_frontier_vels, dtype=np.float64))
+                    running_stage_vel = stage_vel_sum / float(stage_batch_count)
+
+                    stage_baseline_vel = None
+                    can_check_promotion = stage_batch_count >= (MIN_STAGE_BATCHES + RECENT_PROMO_WINDOW)
+                    if can_check_promotion:
+                        baseline_values = stage_frontier_vels[:-RECENT_PROMO_WINDOW]
+                        recent_values = stage_frontier_vels[-RECENT_PROMO_WINDOW:]
+                        if len(baseline_values) >= MIN_STAGE_BATCHES:
+                            stage_baseline_vel = float(np.mean(baseline_values, dtype=np.float64))
+                            recent_mean_vel = float(np.mean(recent_values, dtype=np.float64))
+                        else:
+                            recent_mean_vel = None
+                    else:
+                        recent_mean_vel = None
+
+                    if (
+                        stage_baseline_vel is not None
+                        and recent_mean_vel is not None
+                        and recent_mean_vel <= stage_baseline_vel * (1.0 - improvement_frac)
+                    ):
+                        current_target_N += 1
+                        promotion_count += 1
+                        stage_batch_count = 0
+                        stage_frontier_vels = []
+                        stage_vel_sum = 0.0
+                        stage_baseline_vel = None
+                        running_stage_vel = None
 
             else:
                 state = x_batch.clone()
@@ -1085,8 +900,8 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
                     loss_accum,
                     sample_count,
                     n_count=n_count,
-                    trigger_vel_sum=trigger_vel_sum,
-                    trigger_vel_count=trigger_vel_count,
+                    frontier_vel_running=running_stage_vel if training else None,
+                    frontier_n=current_target_N if training else None,
                 )
 
     loss_tensor = torch.tensor(
@@ -1095,8 +910,8 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
             float(loss_accum["N"]),
             float(n_count),
             float(sample_count),
-            float(trigger_vel_sum),
-            float(trigger_vel_count),
+            float(frontier_vel_sum),
+            float(frontier_vel_count),
         ],
         device=DEVICE,
         dtype=torch.float64,
@@ -1104,27 +919,47 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
     if DDP_ENABLED:
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
 
-    max_target_tensor = torch.tensor([float(max_target_N)], device=DEVICE, dtype=torch.float64)
+    max_target_tensor = torch.tensor([float(max_frontier_N)], device=DEVICE, dtype=torch.float64)
     if DDP_ENABLED:
         dist.all_reduce(max_target_tensor, op=dist.ReduceOp.MAX)
 
-    vel_stat_tensor = torch.tensor(
-        [float(missing_pos_vel_steps), float(vel_candidate_steps)],
-        device=DEVICE,
-        dtype=torch.float64,
-    )
-    if DDP_ENABLED:
-        dist.all_reduce(vel_stat_tensor, op=dist.ReduceOp.SUM)
+    if training:
+        scalar_state = torch.tensor(
+            [
+                float(current_target_N),
+                float(stage_batch_count),
+                float(stage_vel_sum),
+                float(stage_baseline_vel) if stage_baseline_vel is not None else -1.0,
+                float(promotion_count),
+                float(improvement_frac) if training else -1.0,
+            ],
+            device=DEVICE,
+            dtype=torch.float64,
+        )
+        if DDP_ENABLED:
+            dist.all_reduce(scalar_state, op=dist.ReduceOp.MAX)
+        final_target_n = int(scalar_state[0].item())
+        final_stage_batch_count = int(scalar_state[1].item())
+        final_stage_vel_sum = float(scalar_state[2].item())
+        final_stage_baseline = float(scalar_state[3].item())
+        final_stage_baseline = final_stage_baseline if final_stage_baseline >= 0.0 else float("nan")
+        total_promotions = int(scalar_state[4].item())
+        final_improvement_frac = float(scalar_state[5].item())
+    else:
+        final_target_n = -1
+        final_stage_batch_count = 0
+        final_stage_vel_sum = 0.0
+        final_stage_baseline = float("nan")
+        total_promotions = 0
+        final_improvement_frac = float("nan")
 
-    total_mse, total_N, total_n_count, total_samples, total_trigger_vel_sum, total_trigger_vel_count = loss_tensor.tolist()
-    total_missing_pos_steps, total_candidate_steps = vel_stat_tensor.tolist()
+    total_mse, total_N, total_n_count, total_samples, total_frontier_vel_sum, total_frontier_vel_count = loss_tensor.tolist()
     denom = max(1.0, total_samples)
     max_N_reached = int(max_target_tensor.item())
-    pos_vel_none_pct = (100.0 * total_missing_pos_steps / total_candidate_steps) if total_candidate_steps > 0 else 0.0
-    avg_rollout_n = (total_N / max(1.0, total_n_count)) if training else 0.0
-    epoch_trigger_vel = (
-        (total_trigger_vel_sum / total_trigger_vel_count)
-        if (training and total_trigger_vel_count > 0)
+    avg_target_n = (total_N / max(1.0, total_n_count)) if training else 0.0
+    epoch_frontier_vel = (
+        (total_frontier_vel_sum / total_frontier_vel_count)
+        if (training and total_frontier_vel_count > 0)
         else float("nan")
     )
 
@@ -1138,20 +973,27 @@ def run_epoch(model, loader, zero_norm, get_labels_fn, training, optimizer=None,
     else:
         gathered_val = None
 
-    gathered_triggered_ns = gather_triggered_ns(triggered_ns) if training else None
+    final_stage_running_vel = (
+        final_stage_vel_sum / float(final_stage_batch_count)
+        if final_stage_batch_count > 0
+        else float("nan")
+    )
 
     return {
         "mse": total_mse / denom,
-        "N": avg_rollout_n,
-        "trigger_vel": epoch_trigger_vel,
-        "trigger_vel_count": int(total_trigger_vel_count) if training else 0,
-        "max_N": max_N_reached if training else max_rollout_seen - 1,
-        "pos_vel_none_pct": pos_vel_none_pct if training else 0.0,
+        "avg_target_N": avg_target_n,
+        "train_frontier_vel": epoch_frontier_vel,
+        "frontier_baseline_vel": final_stage_baseline,
+        "stage_batch_count": final_stage_batch_count,
+        "promotion_count": total_promotions,
+        "promotion_improvement_frac": final_improvement_frac,
+        "train_frontier_N": final_target_n,
+        "max_frontier_N": max_N_reached if training else max_rollout_seen - 1,
+        "running_stage_frontier_vel": final_stage_running_vel,
+        "frontier_vel_count": int(total_frontier_vel_count) if training else 0,
         "all_val_mses": gathered_val if (not training and is_main_process()) else None,
-        "triggered_ns": gathered_triggered_ns if (training and is_main_process()) else None,
         "batch_progress": batch_progress if (training and is_main_process()) else None,
         "batch_n_values": batch_n_values if (training and is_main_process()) else None,
-        "batch_is_forced_n0": batch_is_forced_n0 if (training and is_main_process()) else None,
     }
 
 
@@ -1234,83 +1076,13 @@ def analyze_and_plot(all_mses, out_dir, epoch, log_path=None):
     print(f"\nPlots saved successfully to: {plot_path}")
 
 
-def plot_triggered_n_distribution(triggered_ns, out_dir, epoch, log_path=None):
-    os.makedirs(out_dir, exist_ok=True)
-
-    values = np.asarray(triggered_ns, dtype=np.int64)
-    valid_values = values[values >= 0]
-    no_target_count = int((values < 0).sum())
-
-    if valid_values.size > 0:
-        max_bin = max(MAX_ROLLOUT_LEN - 1, int(valid_values.max()))
-        counts = np.bincount(valid_values, minlength=max_bin + 1)
-    else:
-        counts = np.zeros(MAX_ROLLOUT_LEN, dtype=np.int64)
-    steps = np.arange(counts.shape[0])
-
-    summary_lines = [
-        "",
-        f"--- Epoch {epoch} Triggered N Distribution ---",
-        f"Total batches: {int(values.size)}",
-        f"N=NONE: {no_target_count}",
-    ]
-    for step, count in zip(steps, counts):
-        summary_lines.append(f"N={step:02d}: {int(count)}")
-    summary_str = "\n".join(summary_lines)
-    print(summary_str)
-
-    if log_path:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(summary_str + "\n\n")
-
-    fig, ax = plt.subplots(1, 1, figsize=(9, 5), facecolor="#111")
-    ax.set_facecolor("#111")
-    ax.bar(steps, counts, color="#7bdff2", edgecolor="#d6f6ff", linewidth=0.8)
-    ax.set_title("Triggered N Distribution per Epoch", color="white", fontsize=12)
-    ax.set_xlabel("Triggered rollout step N", color="white")
-    ax.set_ylabel("Batch count", color="white")
-    ax.set_xticks(steps)
-    ax.tick_params(colors="white")
-    ax.text(
-        0.5,
-        0.98,
-        "Includes fixed_target=0 batches",
-        transform=ax.transAxes,
-        ha="center",
-        va="top",
-        color="#cccccc",
-        fontsize=9,
-    )
-    if no_target_count > 0:
-        ax.text(
-            0.5,
-            0.90,
-            f"No target: {no_target_count}",
-            transform=ax.transAxes,
-            ha="center",
-            va="top",
-            color="#ffb86c",
-            fontsize=9,
-        )
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#555")
-
-    plt.tight_layout()
-    plot_path = os.path.join(out_dir, f"triggered_n_distribution_epoch_{epoch:03d}.png")
-    plt.savefig(plot_path, dpi=150, facecolor="#111")
-    plt.close()
-
-    print(f"  Saved: {plot_path}")
-
-
-def plot_epoch_n_progress_ema(
+def plot_epoch_curriculum_n_progress_ema(
     batch_progress,
     batch_n_values,
     out_dir,
     epoch,
     ema_alpha=N_PROGRESS_EMA_ALPHA,
     log_path=None,
-    batch_is_forced_n0=None,
 ):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1319,18 +1091,8 @@ def plot_epoch_n_progress_ema(
     if x.size == 0 or y.size == 0 or x.shape[0] != y.shape[0]:
         return None
 
-    forced = np.zeros_like(y, dtype=bool)
-    if batch_is_forced_n0 is not None:
-        forced_arr = np.asarray(batch_is_forced_n0, dtype=bool)
-        if forced_arr.shape[0] != y.shape[0]:
-            # Keep plotting robust even if caller-provided metadata length differs.
-            forced[: min(forced_arr.shape[0], y.shape[0])] = forced_arr[: min(forced_arr.shape[0], y.shape[0])]
-        else:
-            forced = forced_arr
-
-    valid_mask = np.isfinite(y) & (~forced)
-    x_plot = x[valid_mask]
-    y_plot = y[valid_mask]
+    x_plot = x
+    y_plot = y
 
     if x_plot.size == 0:
         fig, ax = plt.subplots(1, 1, figsize=(10, 5), facecolor="#111")
@@ -1338,13 +1100,13 @@ def plot_epoch_n_progress_ema(
         ax.set_xlim(0.0, 1.0)
         ax.set_ylim(-0.5, float(MAX_ROLLOUT_LEN))
         ax.set_xlabel("Batch / Total Batches", color="white")
-        ax.set_ylabel("Triggered rollout step N", color="white")
-        ax.set_title(f"Epoch {epoch} N vs Batch Progress", color="white", fontsize=12)
+        ax.set_ylabel("Curriculum frontier N", color="white")
+        ax.set_title(f"Epoch {epoch} Curriculum Frontier N", color="white", fontsize=12)
         ax.tick_params(colors="white")
         ax.text(
             0.5,
             0.5,
-            "No plottable N points after filtering NaN and forced N=0 samples",
+            "No curriculum points were collected for this epoch",
             transform=ax.transAxes,
             ha="center",
             va="center",
@@ -1354,7 +1116,7 @@ def plot_epoch_n_progress_ema(
         for spine in ax.spines.values():
             spine.set_edgecolor("#555")
         plt.tight_layout()
-        plot_path = os.path.join(out_dir, f"n_progress_ema_epoch_{epoch:03d}.png")
+        plot_path = os.path.join(out_dir, f"curriculum_n_progress_ema_epoch_{epoch:03d}.png")
         plt.savefig(plot_path, dpi=150, facecolor="#111")
         plt.close()
         print(f"  Saved: {plot_path}")
@@ -1367,16 +1129,13 @@ def plot_epoch_n_progress_ema(
         ema[i] = ema_state
 
     valid_points = int(x_plot.size)
-    none_points = int((~np.isfinite(y)).sum())
-    forced_points = int(forced.sum())
-
     fig, ax = plt.subplots(1, 1, figsize=(10, 5), facecolor="#111")
     ax.set_facecolor("#111")
-    ax.plot(x_plot, y_plot, color="#7bdff2", alpha=0.35, linewidth=1.0, label="Batch N (filtered)")
+    ax.plot(x_plot, y_plot, color="#7bdff2", alpha=0.35, linewidth=1.0, label="Batch frontier N")
     ax.plot(x_plot, ema, color="#ffaa00", linewidth=2.0, label=f"EMA (alpha={ema_alpha:.2f})")
-    ax.set_title(f"Epoch {epoch} N vs Batch Progress", color="white", fontsize=12)
+    ax.set_title(f"Epoch {epoch} Curriculum Frontier N", color="white", fontsize=12)
     ax.set_xlabel("Batch / Total Batches", color="white")
-    ax.set_ylabel("Triggered rollout step N", color="white")
+    ax.set_ylabel("Curriculum frontier N", color="white")
     ax.set_xlim(0.0, 1.0)
     ax.set_ylim(-0.5, max(float(MAX_ROLLOUT_LEN), float(np.nanmax(ema) + 1.0 if np.isfinite(ema).any() else MAX_ROLLOUT_LEN)))
     ax.grid(color="#333", linestyle="--", linewidth=0.6, alpha=0.4)
@@ -1385,7 +1144,7 @@ def plot_epoch_n_progress_ema(
     ax.text(
         0.02,
         0.98,
-        f"valid N: {valid_points} | no target: {none_points} | forced N0 skipped: {forced_points}",
+        f"points: {valid_points}",
         transform=ax.transAxes,
         ha="left",
         va="top",
@@ -1396,15 +1155,15 @@ def plot_epoch_n_progress_ema(
         spine.set_edgecolor("#555")
 
     plt.tight_layout()
-    plot_path = os.path.join(out_dir, f"n_progress_ema_epoch_{epoch:03d}.png")
+    plot_path = os.path.join(out_dir, f"curriculum_n_progress_ema_epoch_{epoch:03d}.png")
     plt.savefig(plot_path, dpi=150, facecolor="#111")
     plt.close()
 
     if log_path:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
-                f"Epoch {epoch} N-progress EMA plot: {plot_path} "
-                f"(alpha={ema_alpha:.2f}, valid={valid_points}, none={none_points}, forced_n0_skipped={forced_points})\n"
+                f"Epoch {epoch} curriculum N-progress EMA plot: {plot_path} "
+                f"(alpha={ema_alpha:.2f}, points={valid_points})\n"
             )
 
     print(f"  Saved: {plot_path}")
@@ -1414,8 +1173,8 @@ def save_rollout_video(model_to_render, sim_info, mean, std, zero_norm, get_labe
     video_states = load_packed_array(sim_info["states_path"])
     warmup_idx = warmup_start_index(sim_info["n_frames"])
     usable_len = max(1, sim_info["n_frames"] - warmup_idx)
-    start_idx = warmup_idx + int(usable_len * 0.50)
-    end_idx = warmup_idx + int(usable_len * 0.75)
+    start_idx = warmup_idx + int(usable_len * VIDEO_START_FRAC)
+    end_idx = warmup_idx + int(usable_len * VIDEO_END_FRAC)
     end_idx = min(sim_info["n_frames"], max(start_idx + 1, end_idx))
     rollout_len = end_idx - start_idx
 
@@ -1467,7 +1226,7 @@ def save_rollout_video(model_to_render, sim_info, mean, std, zero_norm, get_labe
     writer = None
     writer_mode = "gif"
     try:
-        writer = animation.FFMpegWriter(fps=FPS_VID, codec="libx264", bitrate=1800)
+        writer = animation.FFMpegWriter(fps=FPS_VID, codec=VIDEO_CODEC, bitrate=VIDEO_BITRATE)
         writer_mode = "mp4"
     except (RuntimeError, FileNotFoundError, OSError):
         writer = animation.PillowWriter(fps=FPS_VID)
@@ -1538,8 +1297,8 @@ def save_rollout_video(model_to_render, sim_info, mean, std, zero_norm, get_labe
 # ---------------------------------------------------------------------------
 def main():
     setup_distributed()
-    torch.manual_seed(42 + RANK)
-    np.random.seed(42 + RANK)
+    torch.manual_seed(GLOBAL_SEED + RANK)
+    np.random.seed(GLOBAL_SEED + RANK)
 
     os.makedirs(OUT_DIR, exist_ok=True)
     print0(f"Device: {DEVICE}")
@@ -1622,9 +1381,9 @@ def main():
         print0("  Device prefetch: enabled")
 
     optimizer = create_optimizer(model)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.25)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=SCHED_STEP_SIZE, gamma=SCHED_GAMMA)
 
-    task_label = torch.tensor([1000], dtype=torch.long, device=DEVICE)
+    task_label = torch.tensor([TASK_LABEL_ID], dtype=torch.long, device=DEVICE)
 
     def get_labels(batch_size):
         return task_label.expand(batch_size)
@@ -1660,8 +1419,14 @@ def main():
     print0("\nWarm-up pass (lazy buffer initialisation) ...")
     model.eval()
     with torch.no_grad():
-        _dummy_in = torch.zeros(1, 3, 256, 256, device=DEVICE)
-        _ = model(_dummy_in, class_labels=get_labels(1))
+        _dummy_in = torch.zeros(
+            WARMUP_DUMMY_BATCH,
+            MODEL_IN_CHANNELS,
+            MODEL_SAMPLE_SIZE,
+            MODEL_SAMPLE_SIZE,
+            device=DEVICE,
+        )
+        _ = model(_dummy_in, class_labels=get_labels(WARMUP_DUMMY_BATCH))
         del _dummy_in, _
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
@@ -1672,9 +1437,10 @@ def main():
             loss_log_path = os.path.join(OUT_DIR, f"loss_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
             with open(loss_log_path, "w", encoding="utf-8") as log_file:
                 log_file.write(
-                    "timestamp epoch lr bptt "
-                    "train_mse train_N train_trigger_vel trigger_vel_count "
-                    "train_max_N val_mse best\n"
+                    "timestamp epoch lr "
+                    "train_mse avg_target_N train_frontier_vel frontier_baseline_vel "
+                    "stage_batch_count promotion_count promotion_improvement_frac "
+                    "max_frontier_N val_mse best\n"
                 )
 
         for epoch in range(start_epoch, EPOCHS + 1):
@@ -1683,54 +1449,23 @@ def main():
             if val_sampler is not None:
                 val_sampler.set_epoch(epoch)
             
-            # Calibrate before every epoch so EVT thresholds track the model as it changes.
-            calib_loader = train_loader
-            print0("Calibrating on train split loader: train_loader")
-            calibrate_velocity_threshold(
-                model,
-                calib_loader,
-                zero_norm,
-                get_labels,
-                epoch=epoch,
-                log_path=loss_log_path,
-            )
-
-            print0("\nPost-calibration warm-up (de-tainting inference tensors) ...")
-            model.train()
-            with torch.enable_grad():
-                _dummy_in = torch.zeros(1, 3, 256, 256, device=DEVICE, requires_grad=False)
-                _dummy_out = model(_dummy_in, class_labels=get_labels(1)).sample
-                _dummy_out.sum().backward()
-                del _dummy_in, _dummy_out
-            optimizer.zero_grad(set_to_none=True)
-            if DEVICE == "cuda":
-                torch.cuda.empty_cache()
-            print0("  Done.")
-
             if DDP_ENABLED:
                 ddp_barrier()
 
             current_lr = optimizer.param_groups[0]["lr"]
-            if VEL_EPSILON_BY_STEP is not None:
-                eps_view = np.asarray(VEL_EPSILON_BY_STEP, dtype=np.float32)
-                std_view = np.asarray(VEL_STD_BY_STEP, dtype=np.float32) if VEL_STD_BY_STEP is not None else np.zeros_like(eps_view)
-                if std_view.shape[0] < eps_view.shape[0]:
-                    std_padded = np.zeros(eps_view.shape[0], dtype=np.float32)
-                    std_padded[: std_view.shape[0]] = std_view
-                    std_view = std_padded
-                thr_view = eps_view - std_view
-                thr_valid = thr_view[1:MAX_ROLLOUT_LEN] if thr_view.shape[0] > 1 else np.asarray([], dtype=np.float32)
-                if thr_valid.size > 0:
-                    thr_min = float(np.min(thr_valid))
-                    thr_max = float(np.max(thr_valid))
-                else:
-                    thr_min = 0.0
-                    thr_max = 0.0
-            else:
-                thr_min = 0.0
-                thr_max = 0.0
-            print0(f"\nEpoch {epoch:02d}/{EPOCHS}  LR: {current_lr:.2e}  "
-                   f"EVT_v_thr[t]=[{thr_min:.3e},{thr_max:.3e}]  BPTT_W={BPTT_WINDOW}")
+            schedule_epoch = epoch - start_epoch + 1
+            schedule_total_epochs = max(1, EPOCHS - start_epoch + 1)
+            required_improvement = epoch_improvement_fraction(
+                epoch=schedule_epoch,
+                total_epochs=schedule_total_epochs,
+                initial_frac=VELOCITY_IMPROVEMENT_FRAC,
+                gamma=IMPROVEMENT_DECAY_GAMMA,
+                min_frac=MIN_IMPROVEMENT_FRAC,
+            )
+            print0(
+                f"\nEpoch {epoch:02d}/{EPOCHS}  LR: {current_lr:.2e}  curriculum starts at N=1  "
+                f"promo_impr={100.0 * required_improvement:.2f}%"
+            )
 
             train_loss = run_epoch(
                 model=model,
@@ -1739,7 +1474,8 @@ def main():
                 get_labels_fn=get_labels,
                 training=True,
                 optimizer=optimizer,
-                global_step=(epoch - 1) * len(train_loader),
+                epoch=schedule_epoch,
+                total_epochs=schedule_total_epochs,
             )
 
             if val_loader is None:
@@ -1751,23 +1487,21 @@ def main():
                     zero_norm=zero_norm,
                     get_labels_fn=get_labels,
                     training=False,
+                    epoch=schedule_epoch,
+                    total_epochs=schedule_total_epochs,
                 )
                 if is_main_process() and val_loss["all_val_mses"] is not None:
                     # Pass the loss_log_path to write the table to it
                     analyze_and_plot(val_loss["all_val_mses"], OUT_DIR, epoch, log_path=loss_log_path)
 
-            if is_main_process() and train_loss.get("triggered_ns") is not None:
-                plot_triggered_n_distribution(train_loss["triggered_ns"], OUT_DIR, epoch, log_path=loss_log_path)
-
             if is_main_process() and train_loss.get("batch_progress") is not None and train_loss.get("batch_n_values") is not None:
-                plot_epoch_n_progress_ema(
+                plot_epoch_curriculum_n_progress_ema(
                     train_loss["batch_progress"],
                     train_loss["batch_n_values"],
                     OUT_DIR,
                     epoch,
                     ema_alpha=N_PROGRESS_EMA_ALPHA,
                     log_path=loss_log_path,
-                    batch_is_forced_n0=train_loss.get("batch_is_forced_n0"),
                 )
 
             scheduler.step()
@@ -1798,8 +1532,9 @@ def main():
 
             print0(
                 f"  train: mse={train_loss['mse']:.6e}\n"
-                f"         avg rollout N={train_loss['N']:.2e}  max N reached={train_loss['max_N']}  max allowed N={MAX_ROLLOUT_LEN}  trigger_vel={train_loss['trigger_vel']:.6e}  trigger_count={train_loss['trigger_vel_count']}\n"
-                f"         pos-vel none pct={train_loss['pos_vel_none_pct']:.2f}%\n"
+                f"         avg target N={train_loss['avg_target_N']:.2e}  current frontier N={train_loss['train_frontier_N']}  max frontier N={train_loss['max_frontier_N']}\n"
+                f"         frontier vel={train_loss['train_frontier_vel']:.6e}  baseline vel={train_loss['frontier_baseline_vel']:.6e}  stage batches={train_loss['stage_batch_count']}  promotions={train_loss['promotion_count']}\n"
+                f"         required improvement={100.0 * train_loss['promotion_improvement_frac']:.2f}% (last-{RECENT_PROMO_WINDOW} vs prior baseline)\n"
                 f"  val  : mse={val_loss['mse']:.6e}{best_marker}\n"
                 f"{mem_line}"
             )
@@ -1808,11 +1543,14 @@ def main():
             if is_main_process() and loss_log_path:
                 with open(loss_log_path, "a", encoding="utf-8") as log_file:
                     log_file.write(
-                        f"{datetime.now().isoformat()} epoch={epoch} lr={current_lr:.2e} bptt={BPTT_WINDOW} "
-                        f"train_mse={train_loss['mse']:.6e} train_N={train_loss['N']:.2e} "
-                        f"train_max_N={train_loss['max_N']} "
-                        f"train_trigger_vel={train_loss['trigger_vel']:.6e} "
-                        f"trigger_vel_count={train_loss['trigger_vel_count']} "
+                        f"{datetime.now().isoformat()} epoch={epoch} lr={current_lr:.2e} "
+                        f"train_mse={train_loss['mse']:.6e} avg_target_N={train_loss['avg_target_N']:.2e} "
+                        f"train_frontier_vel={train_loss['train_frontier_vel']:.6e} "
+                        f"frontier_baseline_vel={train_loss['frontier_baseline_vel']:.6e} "
+                        f"stage_batch_count={train_loss['stage_batch_count']} "
+                        f"promotion_count={train_loss['promotion_count']} "
+                        f"promotion_improvement_frac={train_loss['promotion_improvement_frac']:.6e} "
+                        f"max_frontier_N={train_loss['max_frontier_N']} "
                         f"val_mse={val_loss['mse']:.6e} {epoch_log_note}\n"
                     )
 
