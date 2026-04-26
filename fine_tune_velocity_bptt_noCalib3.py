@@ -9,7 +9,8 @@ Key design decisions:
   - MSE loss is computed on raw model output (no mask in loss).
   - The mask is applied ONLY when advancing the rollout state.
     - Every epoch starts at curriculum frontier N=1 (second rollout step).
-    - Promotion is stage-based and uses a 20% frontier-velocity improvement rule.
+        - Promotion is stage-based and uses a persisted required-improvement threshold.
+            The threshold is adapted between epochs from rollout reachability and checkpointed.
     - Full BPTT is applied through all steps 0..N with equal-weight mean loss.
     - Curriculum stage state resets on every promotion and at each epoch.
     - LoRA is injected into qkv, to_qkv, fc1, fc2 via PEFT.
@@ -209,7 +210,7 @@ GLOBAL_SEED = 42
 SIM_ROOT = "./data/256_inc"
 OUT_DIR = os.path.join("runs", "karman_finetuned_velocity_LoRA_bptt_noCalib_curriculum3")
 EPOCHS = 40
-BATCH_SIZE = 6
+BATCH_SIZE = 8
 ACCUM_GRAD = 1
 LR = 5e-5
 VAL_FRAC = 0.1
@@ -260,15 +261,17 @@ SCHED_STEP_SIZE = 10
 SCHED_GAMMA = 0.25
 TASK_LABEL_ID = 1000
 
-# Curriculum hyperparameter (epoch 1 value). Effective value decays to 30% of
-# this by the last epoch.
+# Curriculum hyperparameter (initial required frontier-velocity improvement).
+# The next-epoch value is adjusted from rollout reachability and persisted.
 VELOCITY_IMPROVEMENT_FRAC = 0.30
 # Hard minimum improvement requirement (1%).
 MIN_IMPROVEMENT_FRAC = 0.01
-# Method rule (fixed): lock stage baseline after exactly 10 frontier-reaching batches.
+# Method rule (fixed): require at least this many baseline batches before
+# promotion checks.
 MIN_STAGE_BATCHES = 30
-# Method rule (fixed): promotion compares the average over the latest 3
-# frontier-reaching batches against the prior-stage baseline average.
+# Method rule (fixed): promotion compares the average over the latest
+# RECENT_PROMO_WINDOW frontier-reaching batches against the prior-stage
+# baseline average.
 RECENT_PROMO_WINDOW = 10
 # Memory optimization: recompute training activations during backward to reduce VRAM.
 USE_ACTIVATION_CHECKPOINTING = True
@@ -747,10 +750,11 @@ def run_epoch(
     Epoch-local rollout curriculum (training only):
         - Every epoch starts at frontier N=1 (second rollout step).
         - Each batch trains with full BPTT on steps 0..N using equal-weight mean loss.
-                - Promotion is stage-based and uses an epoch-decayed improvement target.
-                - Promotion condition checks mean(last 3 frontier velocities) against
-                    mean(prior stage frontier velocities), requiring at least 10 prior
-                    batches before evaluating the condition.
+                - Promotion is stage-based and uses the provided
+                    `promotion_improvement_frac` threshold for this epoch.
+                - Promotion condition checks mean(last RECENT_PROMO_WINDOW frontier
+                    velocities) against mean(prior-stage frontier velocities), requiring
+                    at least MIN_STAGE_BATCHES prior-stage batches before evaluation.
     """
     if training:
         model.train()
@@ -862,8 +866,8 @@ def run_epoch(
                     and effective_target_N == current_target_N
                 ):
                     stage_frontier_vels.append(float(batch_frontier_vel))
-                    stage_batch_count = len(stage_frontier_vels)
-                    stage_vel_sum = float(np.sum(stage_frontier_vels, dtype=np.float64))
+                    stage_batch_count += 1
+                    stage_vel_sum += float(batch_frontier_vel)
                     running_stage_vel = stage_vel_sum / float(stage_batch_count)
 
                     active_stage_baseline_vel = None
