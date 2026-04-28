@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+import fine_tune_velocity_bptt_noCalib3 as ft
 from peft import LoraConfig, get_peft_model
 
 from sim_cache import discover_simulations, ensure_all_sim_caches, load_packed_array
@@ -42,7 +43,7 @@ from sim_cache import discover_simulations, ensure_all_sim_caches, load_packed_a
 # ---------------------------------------------------------------------------
 DEFAULT_ANALYSIS_ROLLOUT_LEN = 15
 DEFAULT_BATCH_SIZE = 24
-DEFAULT_NUM_ANALYSIS_BATCHES = 50
+DEFAULT_NUM_ANALYSIS_BATCHES = None
 DEFAULT_SIM_ROOT = "./data/256_inc"
 DEFAULT_OUT_DIR = os.path.join("runs", "analysis_finetuned_error_dynamics")
 DEFAULT_BASE_CHECKPOINT = "./runs/karman_mse/last.ckpt"
@@ -339,161 +340,69 @@ def get_model(base_checkpoint_path):
 def load_model_checkpoint(model, checkpoint_path):
     checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
-    model.load_state_dict(state_dict, strict=False)
+    result = ft.unwrap_model(model).load_state_dict(state_dict, strict=False)
+    missing = list(result.missing_keys)
+    unexpected = list(result.unexpected_keys)
+    print(f"Checkpoint load summary: missing={len(missing)} unexpected={len(unexpected)}")
+    if missing:
+        print(f"  first missing keys: {missing[:10]}")
+    if unexpected:
+        print(f"  first unexpected keys: {unexpected[:10]}")
 
 
 # ---------------------------------------------------------------------------
-# Data collection and plotting
+# Validation-method reuse from training code
 # ---------------------------------------------------------------------------
-def collect_error_dynamics(model, loader, zero_norm, get_labels_fn, rollout_len, num_batches):
-    print(f"\nCollecting error dynamics over {num_batches} batches...")
-    model.eval()
-    all_mses = []
+class LimitedLoader:
+    def __init__(self, loader, max_batches):
+        self.loader = loader
+        self.max_batches = max(0, int(max_batches))
 
-    total_batches = min(len(loader), num_batches)
+    def __len__(self):
+        return min(len(self.loader), self.max_batches)
 
-    with torch.inference_mode():
-        for batch_idx, (x_batch, y_seq, mask) in enumerate(
-            tqdm(loader, desc="Analyzing", total=total_batches, leave=True, dynamic_ncols=True)
-        ):
-            if batch_idx >= num_batches:
+    def __iter__(self):
+        for batch_idx, batch in enumerate(self.loader):
+            if batch_idx >= self.max_batches:
                 break
-
-            x_batch, y_seq, mask = move_batch_to_device(x_batch, y_seq, mask)
-            labels = get_labels_fn(x_batch.shape[0])
-            if mask.ndim == 3:
-                mask = mask.unsqueeze(1)
-
-            max_rollout = min(rollout_len, y_seq.shape[1])
-            state = x_batch.clone()
-            batch_mses = []
-
-            for t in range(max_rollout):
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_AMP):
-                    pred = model(state, class_labels=labels).sample
-                pred = pred.float()
-
-                mse_per_sample = F.mse_loss(pred, y_seq[:, t], reduction="none").mean(dim=(1, 2, 3))
-                batch_mses.append(mse_per_sample.cpu().numpy())
-
-                state = torch.lerp(zero_norm, pred, mask)
-
-            all_mses.append(np.stack(batch_mses, axis=1))
-
-    if not all_mses:
-        return np.empty((0, rollout_len), dtype=np.float32)
-    return np.concatenate(all_mses, axis=0)
+            yield batch
 
 
-def analyze_and_plot(all_mses, out_dir, summary_title):
-    os.makedirs(out_dir, exist_ok=True)
+def collect_error_dynamics(model, loader, zero_norm, get_labels_fn, rollout_len, num_batches):
+    """Use the exact validation calculation path from noCalib3 training code.
 
-    if all_mses.size == 0:
+    We temporarily override the imported module's MAX_ROLLOUT_LEN so the same
+    validation loop runs for this script's requested rollout length.
+    """
+    effective_loader = LimitedLoader(loader, num_batches) if num_batches is not None else loader
+    prev_rollout_len = ft.MAX_ROLLOUT_LEN
+    try:
+        ft.MAX_ROLLOUT_LEN = int(rollout_len)
+        val_stats = ft.run_epoch(
+            model=model,
+            loader=effective_loader,
+            zero_norm=zero_norm,
+            get_labels_fn=get_labels_fn,
+            training=False,
+            epoch=1,
+            total_epochs=1,
+            promotion_improvement_frac=None,
+        )
+    finally:
+        ft.MAX_ROLLOUT_LEN = prev_rollout_len
+
+    all_mses = val_stats.get("all_val_mses")
+    if all_mses is None or all_mses.size == 0:
         raise RuntimeError("No analysis samples were collected.")
+    return all_mses
 
-    mean_mse = np.mean(all_mses, axis=0)
-    velocities = all_mses[:, 1:] - all_mses[:, :-1]
-    mean_vel = np.mean(velocities, axis=0)
-    std_vel = np.std(velocities, axis=0)
 
-    accels = all_mses[:, 2:] - 2.0 * all_mses[:, 1:-1] + all_mses[:, :-2]
-    mean_accel = np.mean(accels, axis=0) if accels.shape[1] > 0 else np.empty((0,), dtype=np.float32)
-    std_accel = np.std(accels, axis=0) if accels.shape[1] > 0 else np.empty((0,), dtype=np.float32)
-
-    max_rollout = all_mses.shape[1]
-    output_lines = [
-        "",
-        summary_title,
-        f"{'Step':>6} | {'Mean MSE':>12} | {'Mean Vel':>12} | {'Std Vel':>12} | {'Mean Accel':>12} | {'Std Accel':>12}",
-        "-" * 79,
-    ]
-
-    for t in range(max_rollout):
-        mse_str = f"{mean_mse[t]:>12.6e}"
-
-        if t < 1:
-            vel_str, svel_str = f"{'N/A':>12}", f"{'N/A':>12}"
-        else:
-            vel_str = f"{mean_vel[t - 1]:>12.6e}"
-            svel_str = f"{std_vel[t - 1]:>12.6e}"
-
-        if t < 2:
-            acc_str, sacc_str = f"{'N/A':>12}", f"{'N/A':>12}"
-        else:
-            acc_str = f"{mean_accel[t - 2]:>12.6e}"
-            sacc_str = f"{std_accel[t - 2]:>12.6e}"
-
-        output_lines.append(f"{t:>6} | {mse_str} | {vel_str} | {svel_str} | {acc_str} | {sacc_str}")
-
-    summary_text = "\n".join(output_lines)
-    print(summary_text)
-
-    summary_path = os.path.join(out_dir, "error_dynamics_summary.txt")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write(summary_text + "\n")
-
+def analyze_and_plot(all_mses, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
     raw_path = os.path.join(out_dir, "error_dynamics_raw_mse.npy")
     np.save(raw_path, all_mses.astype(np.float32, copy=False))
-
-    steps = np.arange(max_rollout)
-    vel_steps = np.arange(1, max_rollout)
-    accel_steps = np.arange(2, max_rollout)
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10), facecolor="#111")
-    fig.suptitle(summary_title, color="white", fontsize=16)
-
-    ax = axes[0, 0]
-    ax.set_facecolor("#111")
-    ax.plot(steps, mean_mse, marker="o", color="#00c8ff", linewidth=2)
-    ax.set_title("Mean Absolute MSE ($E_t$)", color="white")
-    ax.set_xlabel("Rollout Step (N)", color="white")
-    ax.set_ylabel("MSE", color="white")
-    ax.tick_params(colors="white")
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#555")
-
-    ax = axes[0, 1]
-    ax.set_facecolor("#111")
-    ax.plot(vel_steps, mean_vel, marker="o", color="#00ff88", linewidth=2)
-    ax.set_title("Mean Velocity ($v_t$)", color="white")
-    ax.set_xlabel("Rollout Step (N)", color="white")
-    ax.set_ylabel("Mean Velocity", color="white")
-    ax.tick_params(colors="white")
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#555")
-
-    ax = axes[1, 0]
-    ax.set_facecolor("#111")
-    if accel_steps.size > 0:
-        ax.plot(accel_steps, mean_accel, marker="o", color="#ffaa00", linewidth=2)
-    ax.set_title("Mean Acceleration ($a_t$)", color="white")
-    ax.set_xlabel("Rollout Step (N)", color="white")
-    ax.set_ylabel("Mean Acceleration", color="white")
-    ax.tick_params(colors="white")
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#555")
-
-    ax = axes[1, 1]
-    ax.set_facecolor("#111")
-    ax.plot(vel_steps, std_vel, marker="o", color="#00ff88", linestyle="--", label="Std Velocity")
-    if accel_steps.size > 0:
-        ax.plot(accel_steps, std_accel, marker="o", color="#ffaa00", linestyle="--", label="Std Acceleration")
-    ax.set_title("Standard Deviations", color="white")
-    ax.set_xlabel("Rollout Step (N)", color="white")
-    ax.set_ylabel("Std Dev", color="white")
-    ax.tick_params(colors="white")
-    ax.legend(framealpha=0.3)
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#555")
-
-    plt.tight_layout()
-    plot_path = os.path.join(out_dir, "error_dynamics_analysis.png")
-    plt.savefig(plot_path, dpi=150, facecolor="#111")
-    plt.close()
-
-    print(f"\nSaved summary to: {summary_path}")
+    ft.analyze_and_plot(all_mses, out_dir, epoch=1, log_path=None)
     print(f"Saved raw MSEs to: {raw_path}")
-    print(f"Saved plot to: {plot_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +438,7 @@ def parse_args():
         "--analysis-batches",
         type=int,
         default=DEFAULT_NUM_ANALYSIS_BATCHES,
-        help="Number of batches to survey.",
+        help="Number of batches to survey. Default: use the full split to match the training validation plot.",
     )
     parser.add_argument(
         "--batch-size",
@@ -549,6 +458,10 @@ def main():
     print(f"Output directory: {args.out_dir}/")
     print(f"Analysis rollout length: {args.rollout_len}")
     print(f"Analysis split: {args.split}")
+    if args.analysis_batches is None:
+        print("Analysis batches: full split")
+    else:
+        print(f"Analysis batches: first {args.analysis_batches}")
 
     print("\nDiscovering simulation folders ...")
     sim_infos = discover_simulations(args.sim_root)
@@ -610,11 +523,7 @@ def main():
         num_batches=args.analysis_batches,
     )
 
-    analyze_and_plot(
-        all_mses,
-        args.out_dir,
-        summary_title=f"Error Dynamics over Long Rollout ({args.split} split, rollout={args.rollout_len})",
-    )
+    analyze_and_plot(all_mses, args.out_dir)
 
 
 if __name__ == "__main__":
